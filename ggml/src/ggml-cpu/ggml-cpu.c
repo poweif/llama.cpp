@@ -2304,10 +2304,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GET_ROWS:
         case GGML_OP_SET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
-                n_tasks = 1;
+                // use threads when the source is in host memory (CPU-only path);
+                // with GPU offloading the thread launch cost exceeds the benefit
+                const bool src_is_host = node->src[0] && node->src[0]->buffer &&
+                                         ggml_backend_buffer_is_host(node->src[0]->buffer);
+                n_tasks = src_is_host ? n_threads : 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:

@@ -93,7 +93,7 @@ important for server batch workloads.
 
 ---
 
-## 4. `get_rows` CPU Threading: Intentionally Disabled
+## 4. `get_rows` CPU Threading: Intentionally Disabled ✅ DONE
 
 **Where:** `ggml/src/ggml-cpu/ggml-cpu.c:2307–2310`
 
@@ -105,6 +105,11 @@ a bottleneck.
 **Proposal:** Make the thread count conditional: use `n_tasks = 1` only when a GPU backend is
 active for this buffer, and `n_tasks = n_threads` otherwise. The logic is already well-understood
 and the change is low-risk.
+
+**Implemented:** Check `ggml_backend_buffer_is_host(node->src[0]->buffer)` at plan time.
+If the source embedding table is in host memory (CPU-only path), set `n_tasks = n_threads`;
+otherwise keep `n_tasks = 1` to avoid thread-launch overhead on the GPU-offloaded path.
+Same logic applied to `SET_ROWS`. The header is already included so no new dependencies.
 
 ---
 
