@@ -304,22 +304,28 @@ llama_kv_cache::llama_kv_cache(
 
     // pre-compute the hadamard matrices in host memory
     if (attn_rot_k || attn_rot_v) {
-        for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
-            attn_rot_hadamard[n] = std::vector<float>(n*n);
+        // Use the 64×64 (smallest valid) rotation matrix for both K and V.
+        // For V this was established empirically (PR #21038); K uses the same
+        // size for reduced memory and flops with no observed quality impact.
+        const int nrot_k = 64;
+        const int nrot_v = 64;
 
+        // Generate only the sizes actually needed; the map deduplicates if they coincide.
+        auto gen_if_new = [&](int64_t n) {
+            if (attn_rot_hadamard.count(n)) { return; }
+            attn_rot_hadamard[n] = std::vector<float>(n * n);
             ggml_init_params params = {
-                /* .mem_size   = */ 1*ggml_tensor_overhead(),
+                /* .mem_size   = */ 1 * ggml_tensor_overhead(),
                 /* .mem_buffer = */ nullptr,
                 /* .no_alloc   = */ true,
             };
-
             ggml_context_ptr ctx { ggml_init(params) };
-
             ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
             tmp->data = attn_rot_hadamard[n].data();
-
             ggml_gen_hadamard(tmp);
-        }
+        };
+        if (attn_rot_k) { gen_if_new(nrot_k); }
+        if (attn_rot_v) { gen_if_new(nrot_v); }
 
         // Pre-upload the rotation matrices to the backend device so they only need to be
         // transferred once rather than on every forward pass.
@@ -334,12 +340,6 @@ llama_kv_cache::llama_kv_cache(
                     }
                 }
             }
-
-            // Rotation sizes mirror build_input_k_rot / build_input_v_rot logic.
-            const int nrot_v = 64;
-            int nrot_k = 64;
-            do { nrot_k *= 2; } while (n_embd_head_k_all % nrot_k == 0);
-            nrot_k /= 2;
 
             const int n_rot_tensors = (attn_rot_k ? 1 : 0) + (attn_rot_v ? 1 : 0);
             ggml_init_params rot_params = {
@@ -1383,11 +1383,8 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     }
 
     // Fallback: allocate an input tensor to be filled by set_input_k_rot each pass.
-    // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-    int nrot = 64;
-    do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
-    nrot /= 2;
+    // Use the smallest valid rotation matrix (64×64) — same as V.
+    const int nrot = 64;
 
     ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
     ggml_set_input(res);

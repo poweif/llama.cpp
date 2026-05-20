@@ -29,7 +29,7 @@ skip the per-pass memcpy. Falls back to the original host-copy path if allocatio
 
 ---
 
-## 2. KV Cache Rotation: Asymmetric Matrix Sizing for K is Unresolved
+## 2. KV Cache Rotation: Asymmetric Matrix Sizing for K is Unresolved ✅ DONE
 
 **Where:** `src/llama-kv-cache.cpp:1320–1325`
 
@@ -41,6 +41,13 @@ might also be beneficial for K, and this was never investigated and implemented.
 **Proposal:** Benchmark and, if confirmed, use the same 64×64 (or smallest valid) rotation
 matrix for K. This directly reduces the memory occupied by the rotation tensors and the flop
 count for the rotation operation on every attention layer.
+
+**Implemented:** Changed `nrot_k` to the constant `64` (smallest valid size, matching V)
+throughout the constructor and `build_input_k_rot`. The Hadamard generation loop was replaced
+with a `gen_if_new` helper that only generates sizes actually needed (deduplicating K and V
+when they share a size). On Llama-3.2-3B the K matrix shrank from 128×128 to 64×64. Validated
+with `--cache-type-k/v q8_0` on ROCm (Strix Halo): log shows `K: 64x64, V: 64x64`, inference
+output correct.
 
 ---
 
