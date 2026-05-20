@@ -302,8 +302,7 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
-    // pre-compute the haramard matrices and keep them in host memory
-    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
+    // pre-compute the hadamard matrices in host memory
     if (attn_rot_k || attn_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
@@ -320,6 +319,68 @@ llama_kv_cache::llama_kv_cache(
             tmp->data = attn_rot_hadamard[n].data();
 
             ggml_gen_hadamard(tmp);
+        }
+
+        // Pre-upload the rotation matrices to the backend device so they only need to be
+        // transferred once rather than on every forward pass.
+        if (!hparams.no_alloc) {
+            // Use the first KV-cache layer's buffer type (same device as KV data).
+            ggml_backend_buffer_type_t rot_buft = ggml_backend_cpu_buffer_type();
+            if (offload) {
+                for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                    if (hparams.has_kv(il) && (!filter || filter(il))) {
+                        rot_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+                        break;
+                    }
+                }
+            }
+
+            // Rotation sizes mirror build_input_k_rot / build_input_v_rot logic.
+            const int nrot_v = 64;
+            int nrot_k = 64;
+            do { nrot_k *= 2; } while (n_embd_head_k_all % nrot_k == 0);
+            nrot_k /= 2;
+
+            const int n_rot_tensors = (attn_rot_k ? 1 : 0) + (attn_rot_v ? 1 : 0);
+            ggml_init_params rot_params = {
+                /* .mem_size   = */ size_t(n_rot_tensors) * ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            ggml_context * rot_ctx = ggml_init(rot_params);
+            if (rot_ctx) {
+                if (attn_rot_k) {
+                    attn_rot_k_dev = ggml_new_tensor_2d(rot_ctx, GGML_TYPE_F32, nrot_k, nrot_k);
+                    ggml_set_name(attn_rot_k_dev, "attn_rot_k_dev");
+                }
+                if (attn_rot_v) {
+                    attn_rot_v_dev = ggml_new_tensor_2d(rot_ctx, GGML_TYPE_F32, nrot_v, nrot_v);
+                    ggml_set_name(attn_rot_v_dev, "attn_rot_v_dev");
+                }
+
+                ggml_backend_buffer_t rot_buf = ggml_backend_alloc_ctx_tensors_from_buft(rot_ctx, rot_buft);
+                if (rot_buf) {
+                    if (attn_rot_k) {
+                        ggml_backend_tensor_set(attn_rot_k_dev, attn_rot_hadamard.at(nrot_k).data(),
+                                                0, ggml_nbytes(attn_rot_k_dev));
+                    }
+                    if (attn_rot_v) {
+                        ggml_backend_tensor_set(attn_rot_v_dev, attn_rot_hadamard.at(nrot_v).data(),
+                                                0, ggml_nbytes(attn_rot_v_dev));
+                    }
+                    rot_ctx_buf = { ggml_context_ptr(rot_ctx), ggml_backend_buffer_ptr(rot_buf) };
+                    LLAMA_LOG_INFO("%s: rotation matrices pre-uploaded to %s (K: %dx%d, V: %dx%d)\n",
+                        __func__, ggml_backend_buffer_name(rot_buf),
+                        attn_rot_k ? nrot_k : 0, attn_rot_k ? nrot_k : 0,
+                        attn_rot_v ? nrot_v : 0, attn_rot_v ? nrot_v : 0);
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to allocate device buffer for rotation matrices, "
+                                   "falling back to per-call host→device transfer\n", __func__);
+                    ggml_free(rot_ctx);
+                    attn_rot_k_dev = nullptr;
+                    attn_rot_v_dev = nullptr;
+                }
+            }
         }
     }
 
@@ -1312,43 +1373,46 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
-    ggml_tensor * res = nullptr;
-
-    if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
-
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
-        ggml_set_input(res);
-        ggml_set_name(res, "attn_inp_k_rot");
+    if (!attn_rot_k) {
+        return nullptr;
     }
 
+    // Return the pre-uploaded device tensor directly — avoids a host→device copy each forward pass.
+    if (attn_rot_k_dev) {
+        return attn_rot_k_dev;
+    }
+
+    // Fallback: allocate an input tensor to be filled by set_input_k_rot each pass.
+    // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+    int nrot = 64;
+    do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
+    nrot /= 2;
+
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_k_rot");
     return res;
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
-    ggml_tensor * res = nullptr;
-
-    if (attn_rot_v) {
-        int nrot = 64;
-        // using smaller rotation matrices for V seems beneficial
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
-        //do {
-        //    nrot *= 2;
-        //} while (hparams.n_embd_head_v() % nrot == 0);
-        //nrot /= 2;
-
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
-        ggml_set_input(res);
-        ggml_set_name(res, "attn_inp_v_rot");
+    if (!attn_rot_v) {
+        return nullptr;
     }
 
+    // Return the pre-uploaded device tensor directly — avoids a host→device copy each forward pass.
+    if (attn_rot_v_dev) {
+        return attn_rot_v_dev;
+    }
+
+    // Fallback: allocate an input tensor to be filled by set_input_v_rot each pass.
+    // using smaller rotation matrices for V seems beneficial
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
+    int nrot = 64;
+
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_v_rot");
     return res;
 }
 
@@ -1671,20 +1735,22 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == attn_rot_k_dev) {
+        return; // already resident on device — nothing to copy
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
     const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
-
+    GGML_ASSERT(attn_rot_hadamard.count(n_rot));
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst == attn_rot_v_dev) {
+        return; // already resident on device — nothing to copy
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
     const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
-
+    GGML_ASSERT(attn_rot_hadamard.count(n_rot));
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 

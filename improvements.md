@@ -6,7 +6,7 @@ work they entail vs. how much they would help for large-model inference.
 
 ---
 
-## 1. KV Cache: Hadamard Rotation Matrix — Host→Device Transfer on Every Forward Pass
+## 1. KV Cache: Hadamard Rotation Matrix — Host→Device Transfer on Every Forward Pass ✅ DONE
 
 **Where:** `src/llama-kv-cache.cpp:306`
 
@@ -18,6 +18,14 @@ host→device PCIe transfer that blocks the GPU.
 **Proposal:** Pre-upload the rotation matrices to each backend's buffer type at cache
 construction time. The matrices are fixed for the lifetime of the model; a one-time upload
 eliminates recurring transfers and removes this GPU pipeline stall.
+
+**Implemented:** `llama_kv_cache` constructor now allocates a dedicated backend buffer on the
+same device as the first KV-cache layer, creates `attn_rot_k_dev` / `attn_rot_v_dev` tensors,
+and uploads the Hadamard data once via `ggml_backend_tensor_set`. `build_input_k/v_rot` return
+the device tensor directly (treated as a constant weight by the scheduler); `set_input_k/v_rot`
+skip the per-pass memcpy. Falls back to the original host-copy path if allocation fails or
+`no_alloc` is set. Validated on Llama-3.2-3B with `--cache-type-k q8_0 --cache-type-v q8_0`
+(ROCm backend, Strix Halo APU).
 
 ---
 

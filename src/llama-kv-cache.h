@@ -244,8 +244,14 @@ private:
     int32_t n_embd_head_k_all = 0;
     int32_t n_embd_head_v_all = 0;
 
-    // pre-computed hadamard martrices
+    // pre-computed hadamard matrices (host-side, always present when attn_rot_k/v is true)
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // device-resident copies of the rotation matrices, pre-uploaded once at construction.
+    // nullptr when no_alloc is set or the upload failed (falls back to per-call host copy).
+    ggml_tensor * attn_rot_k_dev = nullptr;
+    ggml_tensor * attn_rot_v_dev = nullptr;
+    std::pair<ggml_context_ptr, ggml_backend_buffer_ptr> rot_ctx_buf;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
