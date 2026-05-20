@@ -22,6 +22,11 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // pre-computed per-node fusion skip counts; allocated from the tail of work_data
+        // fused[i] = number of subsequent nodes consumed by fusion at node i (0 = no fusion)
+        // NULL = fall back to per-node detection (e.g. work_data not yet assigned)
+        int8_t * fused;
     };
 
     // numa strategies

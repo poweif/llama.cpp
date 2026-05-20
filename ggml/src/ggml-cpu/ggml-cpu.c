@@ -2964,10 +2964,14 @@ struct ggml_cplan ggml_graph_plan(
         work_size += CACHE_LINE_SIZE*(n_threads);
     }
 
+    // reserve n_nodes bytes at the tail of work_data for the per-node fusion table
+    work_size += cgraph->n_nodes * sizeof(int8_t);
+
     cplan.threadpool = threadpool;
     cplan.n_threads  = MIN(max_tasks, n_threads);
     cplan.work_size  = work_size;
     cplan.work_data  = NULL;
+    cplan.fused      = NULL; // set in ggml_graph_compute after work_data is allocated
 
     return cplan;
 }
@@ -3051,13 +3055,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-        if (n_fused > 0) {
-            node_n += n_fused;
-        } else {
+        // Use the pre-computed fusion table when available: skip ggml_cpu_try_fuse_ops
+        // detection for nodes known not to fuse (the common case), call it only when
+        // cplan->fused[node_n] > 0 (rare) or when the table isn't ready (cplan->fused == NULL).
+        const int8_t pre_fused = cplan->fused ? cplan->fused[node_n] : -1;
+        if (pre_fused == 0) {
             ggml_compute_forward(&params, node);
+        } else {
+            const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+            if (n_fused > 0) {
+                node_n += n_fused;
+            } else {
+                ggml_compute_forward(&params, node);
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3301,12 +3311,50 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+// Pre-compute per-node fusion decisions into the tail of work_data.
+// Mirrors the detection logic in ggml_cpu_try_fuse_ops so the compute loop
+// can skip detection for nodes already known not to participate in fusion.
+static void ggml_cpu_build_fused_table(const struct ggml_cgraph * cgraph, int8_t * fused) {
+    memset(fused, 0, cgraph->n_nodes * sizeof(int8_t));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_op_is_empty(node->op))                          { continue; }
+        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE))           { continue; }
+        if (node->op != GGML_OP_RMS_NORM)                        { continue; }
+        const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+        if (!ggml_can_fuse(cgraph, i, fuse_ops, 2))              { continue; }
+        struct ggml_tensor * mul_node = cgraph->nodes[i + 1];
+        const struct ggml_tensor * mul_w = (mul_node->src[0] == node)
+            ? mul_node->src[1] : mul_node->src[0];
+        if (node->src[0]->type == GGML_TYPE_F32 &&
+            mul_node->type     == GGML_TYPE_F32 &&
+            mul_w->type        == GGML_TYPE_F32 &&
+            mul_w->ne[0]       == node->ne[0]   &&
+            mul_w->nb[0]       == sizeof(float)) {
+            fused[i] = 1;
+        }
+    }
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+
+    // locate the fusion table at the tail of work_data and populate it once before
+    // threading starts; all threads then read it cheaply in the hot compute loop
+    if (cgraph->n_nodes > 0 && cplan->work_data != NULL) {
+        cplan->fused = (int8_t *)(cplan->work_data + cplan->work_size - cgraph->n_nodes);
+        if (!ggml_cpu_disable_fusion && !cplan->use_ref) {
+            ggml_cpu_build_fused_table(cgraph, cplan->fused);
+        } else {
+            memset(cplan->fused, 0, cgraph->n_nodes * sizeof(int8_t));
+        }
+    } else {
+        cplan->fused = NULL;
+    }
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;

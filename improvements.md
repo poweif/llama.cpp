@@ -113,7 +113,7 @@ Same logic applied to `SET_ROWS`. The header is already included so no new depen
 
 ---
 
-## 5. Fused Op Detection: Runs Per-Node at Compute Time, Not at Plan Time
+## 5. Fused Op Detection: Runs Per-Node at Compute Time, Not at Plan Time ✅ DONE
 
 **Where:** `ggml/src/ggml-cpu/ggml-cpu.c:3053`
 
@@ -126,6 +126,25 @@ reservation and cache the fusion decisions.
 for the lifetime of the reserved graph, eliminating repeated pattern-matching overhead on the
 hot path. This is especially significant for long context (many layers × many tokens) where
 the compute loop executes thousands of nodes.
+
+**Implemented:**
+- Added `int8_t * fused` to `ggml_cplan` (`ggml-cpu.h`): a nullable pointer to the per-node
+  fusion table; NULL falls back to per-node detection.
+- `ggml_graph_plan` (`ggml-cpu.c`): reserves `n_nodes * sizeof(int8_t)` extra bytes at the
+  tail of `work_size` for the table. Sets `cplan.fused = NULL` (work_data not yet allocated).
+- `ggml_graph_compute` (`ggml-cpu.c`): before starting any worker threads, points `cplan->fused`
+  into `work_data + work_size - n_nodes` and calls `ggml_cpu_build_fused_table` once (new
+  helper that mirrors the detection logic in `ggml_cpu_try_fuse_ops`). Falls back to all-zeros
+  when fusion is disabled or use_ref is set.
+- Compute loop (`ggml_graph_compute_thread`): when `fused[node_n] == 0` (the common case),
+  calls `ggml_compute_forward` directly without entering `ggml_cpu_try_fuse_ops`. When
+  `fused[node_n] > 0`, calls `ggml_cpu_try_fuse_ops` for execution (detection re-run is
+  cheap for the small number of fusable nodes). When `fused == NULL`, retains the original
+  per-node detection as fallback.
+- Primary benefit: n_threads × n_nodes detection comparisons → 1 × n_nodes build pass + n_threads
+  array reads. For 16 threads and 1000 nodes this eliminates ~15K redundant op-type checks per
+  forward pass. Also enables true plan-time caching for the `ggml_backend_cpu_graph_plan_create`
+  path (plan created once, compute called many times).
 
 ---
 
