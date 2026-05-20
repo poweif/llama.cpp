@@ -365,10 +365,12 @@ struct analyze_tools : analyze_base {
 
     // Shared helper: builds func_parser from open+call_id+args, handling atomic wrapping and close.
     // atomic_peek: if present, used as the peek expression in the third atomicity branch.
+    // end_marker: if non-empty, overrides format.per_call_end for the tool_close peek assertion.
     common_peg_parser build_func_parser(common_chat_peg_builder & p, const std::string & name,
                                         const common_peg_parser & call_id_section, bool have_call_id,
                                         const common_peg_parser & args,
-                                        std::optional<common_peg_parser> atomic_peek) const;
+                                        std::optional<common_peg_parser> atomic_peek,
+                                        const std::string & end_marker = "") const;
 };
 
 // ============================================================================

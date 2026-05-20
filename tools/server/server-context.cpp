@@ -36,6 +36,23 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Returns system MemAvailable in KiB, or -1 if unavailable.
+static long get_sys_mem_available_kb() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[128];
+    long val = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %ld kB", &val) == 1) break;
+    }
+    fclose(f);
+    return val;
+#else
+    return -1;
+#endif
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -1910,6 +1927,44 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
+        // Enforce the cache_ram budget against in-flight checkpoints.
+        // In-flight checkpoints live on active slots and are never seen by
+        // server_prompt_cache::update(), so without this check they can grow
+        // completely unbounded (n_ctx_checkpoints=32 × ~1.9 GiB = ~61 GiB).
+        // We treat cache_ram as a unified budget: evict the oldest checkpoint
+        // from this slot if adding a new one would exceed it.
+        if (prompt_cache && prompt_cache->limit_size > 0) {
+            const size_t new_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            // sum checkpoint bytes currently held across all active slots
+            size_t total = 0;
+            for (const auto & s : slots) {
+                for (const auto & c : s.prompt.checkpoints) {
+                    total += c.size();
+                }
+            }
+
+            while (!slot.prompt.checkpoints.empty() && total + new_size > prompt_cache->limit_size) {
+                const auto & front = slot.prompt.checkpoints.front();
+                SLT_WRN(slot,
+                        "cache budget (%.3f MiB) reached, evicting oldest checkpoint "
+                        "(pos_min = %d, pos_max = %d, size = %.3f MiB) to make room for new one (%.3f MiB)\n",
+                        (float) prompt_cache->limit_size / 1024 / 1024,
+                        front.pos_min, front.pos_max, (float) front.size() / 1024 / 1024,
+                        (float) new_size / 1024 / 1024);
+                total -= front.size();
+                slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            }
+
+            if (total + new_size > prompt_cache->limit_size) {
+                // budget fully consumed by other slots — skip this checkpoint
+                SLT_WRN(slot,
+                        "skipping checkpoint: new checkpoint (%.3f MiB) would exceed cache budget (%.3f MiB)\n",
+                        (float) new_size / 1024 / 1024, (float) prompt_cache->limit_size / 1024 / 1024);
+                return;
+            }
+        }
+
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
@@ -2224,6 +2279,30 @@ private:
                 SRV_INF("%s", "all slots are idle\n");
 
                 return;
+            }
+        }
+
+        // periodic memory diagnostics — log every 256 update_slots calls with active work
+        {
+            static uint64_t update_count = 0;
+            if ((++update_count & 0xFF) == 0) {
+                const long mem_kb = get_sys_mem_available_kb();
+                const uint32_t n_ctx_total = llama_n_ctx(ctx_tgt);
+                uint32_t n_tokens_active = 0;
+                for (const auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        n_tokens_active += slot.prompt.n_tokens();
+                    }
+                }
+                if (mem_kb >= 0) {
+                    SRV_INF("mem-diag: sys_mem_avail=%.1f MiB  kv_fill=%u/%u (%.1f%%)  updates=%" PRIu64 "\n",
+                        mem_kb / 1024.0f, n_tokens_active, n_ctx_total,
+                        100.0f * n_tokens_active / (n_ctx_total ? n_ctx_total : 1), update_count);
+                } else {
+                    SRV_INF("mem-diag: sys_mem_avail=n/a  kv_fill=%u/%u (%.1f%%)  updates=%" PRIu64 "\n",
+                        n_tokens_active, n_ctx_total,
+                        100.0f * n_tokens_active / (n_ctx_total ? n_ctx_total : 1), update_count);
+                }
             }
         }
 
@@ -3021,6 +3100,24 @@ private:
 
                     if (!err.empty()) {
                         SRV_ERR("%s i = %d, n_batch = %d, ret = %d\n", err.c_str(), i, n_batch, ret);
+
+                        // diagnostic: dump context fill and system memory at the point of failure
+                        {
+                            const long mem_kb = get_sys_mem_available_kb();
+                            const uint32_t n_ctx_total = llama_n_ctx(ctx_tgt);
+                            if (mem_kb >= 0) {
+                                SRV_ERR("decode-fail-diag: sys_mem_avail=%.1f MiB  n_ctx_total=%u\n",
+                                    mem_kb / 1024.0f, n_ctx_total);
+                            } else {
+                                SRV_ERR("decode-fail-diag: sys_mem_avail=n/a  n_ctx_total=%u\n", n_ctx_total);
+                            }
+                            for (const auto & slot : slots) {
+                                if (slot.is_processing()) {
+                                    SRV_ERR("decode-fail-diag: slot %d  n_tokens=%u  n_ctx=%d\n",
+                                        slot.id, slot.prompt.n_tokens(), slot.n_ctx);
+                                }
+                            }
+                        }
 
                         for (auto & slot : slots) {
                             if (slot.is_processing()) {

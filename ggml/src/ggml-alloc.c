@@ -10,6 +10,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void ggml_log_sys_mem(void) {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return;
+    char line[128];
+    long mem_avail_kb = -1, mem_total_kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemTotal: %ld kB", &mem_total_kb) == 1) continue;
+        if (sscanf(line, "MemAvailable: %ld kB", &mem_avail_kb) == 1) break;
+    }
+    fclose(f);
+    if (mem_avail_kb >= 0 && mem_total_kb >= 0) {
+        GGML_LOG_ERROR("sys-mem-diag: total=%.1f MiB  available=%.1f MiB\n",
+            mem_total_kb / 1024.0, mem_avail_kb / 1024.0);
+    }
+#endif
+}
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MAX_FREE_BLOCKS 256
 
@@ -79,6 +97,7 @@ enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_te
     if (talloc->offset + size > ggml_backend_buffer_get_size(talloc->buffer)) {
         GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %s (needed %zu, available %zu)\n",
                 __func__, tensor->name, size, ggml_backend_buffer_get_size(talloc->buffer) - talloc->offset);
+        ggml_log_sys_mem();
         GGML_ABORT("not enough space in the buffer");
     }
 
@@ -254,6 +273,7 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         // since the last chunk always has virtually endless memory, this should never happen
         GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %zu bytes, largest block available %zu bytes\n",
             __func__, size, max_avail);
+        ggml_log_sys_mem();
         GGML_ABORT("graph allocation: failed to reserve memory");
     }
 

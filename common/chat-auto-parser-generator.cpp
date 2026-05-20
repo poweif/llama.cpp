@@ -84,6 +84,8 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
 
     if (include_grammar) {
+        const bool is_qwen_per_call_style = autoparser.tools.format.section_start.empty() &&
+                                            trigger_marker.find("<tool_call>") != std::string::npos;
         data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
             foreach_function(inputs.tools, [&](const json & tool) {
@@ -103,6 +105,12 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             data.grammar_triggers = {
                 { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, trigger_marker }
             };
+            // For Qwen-style templates, the model sometimes generates <tools> (the system-prompt
+            // definition tag) instead of <tool_call> (the response tag). Add <tools> as a secondary
+            // trigger so the grammar also activates in that case.
+            if (is_qwen_per_call_style) {
+                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<tools>\n" });
+            }
         }
     }
 
@@ -219,13 +227,46 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
         args_field = format.function_field + "." + args_field;
     }
 
+    // For Qwen-style templates (no section wrapper, per_call_start is "<tool_call>\n"), the model
+    // sometimes generates <tools>...</tools> instead of <tool_call>...</tool_call>.  Build an
+    // alternative single-tool parser that accepts the <tools> wrapper so both the grammar and the
+    // PEG parser handle it gracefully.
+    const bool is_qwen_per_call_style = format.section_start.empty() &&
+                                        format.per_call_start.find("<tool_call>") != std::string::npos;
+
     auto tools_parser = p.eps();
     if (format.section_start.empty() && !format.per_call_start.empty()) {
         auto single_tool_parser = p.standard_json_tools(
             format.per_call_start, format.per_call_end, inputs.tools, inputs.parallel_tool_calls,
             inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED, name_field, args_field, format.tools_array_wrapped,
             format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order);
-        tools_parser = p.trigger_rule("tool-calls", p.one_or_more(single_tool_parser + p.space()));
+        if (is_qwen_per_call_style) {
+            // All three section parsers must be non-optional (force=true) so that p.choice()
+            // correctly falls through to the next alternative when one doesn't match.
+            // If any were optional(), the first entry would always win with a 0-char match,
+            // preventing the later alternatives from ever being tried.
+            // The outer tools_parser is wrapped in optional() to handle content-only responses.
+            auto p1 = p.standard_json_tools(
+                format.per_call_start, format.per_call_end, inputs.tools, inputs.parallel_tool_calls,
+                true, name_field, args_field, format.tools_array_wrapped, format.fun_name_is_key,
+                format.id_field, format.gen_id_field, format.parameter_order);
+            // <tools>\n...\n</tools> wrapper (alternate fallback).
+            auto p2 = p.standard_json_tools(
+                "<tools>\n", "</tools>", inputs.tools, inputs.parallel_tool_calls,
+                true, name_field, args_field, format.tools_array_wrapped, format.fun_name_is_key,
+                format.id_field, format.gen_id_field, format.parameter_order);
+            // Raw JSON (no wrapper): long system prompts can cause the model to forget the
+            // <tool_call> format instruction and emit {"name":...} directly (possibly wrapped
+            // in a markdown code fence).
+            auto p3 = p.standard_json_tools(
+                "", "", inputs.tools, inputs.parallel_tool_calls,
+                true, name_field, args_field, format.tools_array_wrapped, format.fun_name_is_key,
+                format.id_field, format.gen_id_field, format.parameter_order);
+            tools_parser = p.optional(p.trigger_rule("tool-calls",
+                p.one_or_more(p.choice({p1, p2, p3}) + p.space())));
+        } else {
+            tools_parser = p.trigger_rule("tool-calls", p.one_or_more(single_tool_parser + p.space()));
+        }
     } else {
         tools_parser = p.standard_json_tools(
             format.section_start, format.section_end, inputs.tools, inputs.parallel_tool_calls,
@@ -246,13 +287,24 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
         tool_start = format.per_call_start;
     }
 
-    return ctx.reasoning_parser + p.optional(p.content(p.until(tool_start))) + tools_parser + p.end();
+    auto content_before = tool_start.empty() ? p.eps() :
+                          (is_qwen_per_call_style
+                               ? p.content(p.until_one_of({tool_start, "<tools>\n", "{\"name\": \""}))
+                               : p.content(p.until(tool_start)));
+    // For qwen per-call style, omit p.end() so that trailing text (e.g. a closing ```
+    // code fence when the model wraps raw JSON in a markdown block) is silently ignored
+    // rather than causing the parse to fail.
+    if (is_qwen_per_call_style) {
+        return ctx.reasoning_parser + p.optional(content_before) + tools_parser;
+    }
+    return ctx.reasoning_parser + p.optional(content_before) + tools_parser + p.end();
 }
 
 common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
                                                     const common_peg_parser & call_id_section, bool have_call_id,
                                                     const common_peg_parser & args,
-                                                    std::optional<common_peg_parser> atomic_peek) const {
+                                                    std::optional<common_peg_parser> atomic_peek,
+                                                    const std::string & end_marker) const {
     auto              open           = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix);
     bool              matched_atomic = false;
     common_peg_parser func_parser    = p.eps();
@@ -270,14 +322,15 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
         func_parser = open + call_id_section + p.space() + args;
     }
 
+    const std::string & effective_end = !end_marker.empty() ? end_marker : format.per_call_end;
     if (!function.close.empty()) {
         func_parser = func_parser + p.space() + p.tool_close(p.literal(function.close));
-    } else if (!format.per_call_end.empty()) {
+    } else if (!effective_end.empty()) {
         // When there's no func_close but there is a per_call_end marker, use peek() to ensure
         // we only emit tool_close when we can actually see the closing marker. This prevents
         // premature closing during partial parsing when we've seen e.g. "</" which could be
         // either "</tool_call>" (end) or "<arg_key>" prefix that failed to match.
-        func_parser = func_parser + p.tool_close(p.peek(p.literal(format.per_call_end)));
+        func_parser = func_parser + p.tool_close(p.peek(p.literal(effective_end)));
     } else {
         func_parser = func_parser + p.tool_close(p.space());  // force this to process tool closing callbacks in mapper
     }
@@ -291,7 +344,17 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
 
-    common_peg_parser tool_choice = p.choice();
+    // For Qwen-style templates (<tool_call> per-call, no section wrapper), the model sometimes
+    // generates <tools>{json}</tools> instead of <tool_call>{json}</tool_call>. Accept both.
+    const bool is_qwen_style = format.section_start.empty() &&
+                               format.per_call_start.find("<tool_call>") != std::string::npos;
+
+    // Build tool_choice parsers.  For Qwen-style we need two: one whose func_parser peeks for
+    // "</tool_call>" (the normal wrapper) and one that peeks for "</tools>" (the fallback wrapper).
+    // Both must be built separately because build_func_parser bakes the end-marker into the
+    // tool_close peek assertion.
+    common_peg_parser tool_choice     = p.choice();
+    common_peg_parser tool_choice_alt = p.choice();  // only used when is_qwen_style
 
     foreach_function(inputs.tools, [&](const json & tool) {
         const auto & func   = tool.at("function");
@@ -321,6 +384,13 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         auto atomic_peek = !arguments.start.empty() ? std::optional(p.peek(p.literal(arguments.start))) : std::nullopt;
         auto func_parser = build_func_parser(p, name, call_id_section, have_call_id, args_parser, atomic_peek);
         tool_choice |= p.rule("tool-" + name, func_parser);
+
+        if (is_qwen_style) {
+            // Build a variant that peeks for "</tools>" instead of "</tool_call>"
+            auto func_parser_alt = build_func_parser(p, name, call_id_section, have_call_id, args_parser, atomic_peek,
+                                                     "</tools>");
+            tool_choice_alt |= p.rule("tool-alt-" + name, func_parser_alt);
+        }
     });
 
     auto require_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
@@ -329,10 +399,15 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
 
     if (!format.per_call_start.empty()) {
         auto wrapped_call = format.per_call_start + tool_choice + format.per_call_end;
+        common_peg_parser effective_call = wrapped_call;
+        if (is_qwen_style) {
+            auto alt_wrapped = std::string("<tools>\n") + tool_choice_alt + std::string("</tools>");
+            effective_call = p.choice({wrapped_call, alt_wrapped});
+        }
         if (inputs.parallel_tool_calls) {
-            tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call));
+            tool_calls = p.trigger_rule("tool-call", effective_call + p.zero_or_more(p.space() + effective_call));
         } else {
-            tool_calls = p.trigger_rule("tool-call", wrapped_call);
+            tool_calls = p.trigger_rule("tool-call", effective_call);
         }
         if (!format.section_start.empty()) {
             tool_calls = p.trigger_rule("tool-calls",
@@ -353,8 +428,11 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         tool_calls = p.optional(tool_calls);
     }
 
-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+    std::string trigger_marker     = !format.section_start.empty() ? format.section_start : format.per_call_start;
+    std::string alt_trigger_marker = is_qwen_style ? "<tools>\n" : "";
+    auto content_before_tools = trigger_marker.empty() ? p.eps() :
+                                (!alt_trigger_marker.empty() ? p.until_one_of({trigger_marker, alt_trigger_marker})
+                                                             : p.until(trigger_marker));
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
 }
 
