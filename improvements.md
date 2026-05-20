@@ -65,20 +65,31 @@ is incompatible with the multi-stream KV cache layout. This forces the system to
 independently per sequence. This unlocks better parallelism for multi-sequence inference,
 important for server batch workloads.
 
-**Implemented:** Removed the three `GGML_ASSERT(!ubatch->equal_seqs())` guards:
+**Implemented:**
 
+*Assertion removals (blocker fixes):*
 - `llm_graph_input_pos_bucket::set_input` (graph.cpp): The encoder self-attention pos-bucket
   loop uses `ubatch->pos[i/j]` which is valid for any token layout; assert was overly
   conservative.
 - `llm_graph_input_attn_cross::set_input` (graph.cpp): Cross-attention mask filling uses
   `ubatch->seq_id[i]` lookups which are layout-independent; assert was overly conservative.
 - `llama_kv_cache::set_input_pos_bucket` (kv-cache.cpp): Rewrote to look up cells via
-  `v_cells[seq_to_stream[seq_id]]` per token instead of hard-coding `v_cells[0]`.  Also
+  `v_cells[seq_to_stream[seq_id]]` per token instead of hard-coding `v_cells[0]`. Also
   removed the `n_stream == 1` guard, since the per-token stream lookup now handles both
   single- and multi-stream correctly.
 
-The TODO at graph.cpp:2123 (n_seqs_unq-based Q/K/V tensor splitting for better GPU
-parallelism) is left as a future investigation; the linked PR noted it "might not be worth it."
+*No-cache encoder path: n_seqs_unq-based Q/K/V splitting (graph.cpp):*
+- `build_attn_inp_no_cache`: when `ubatch.equal_seqs()`, allocates the attention mask as
+  `[n_tps, n_tps, 1, n_seqs_unq]` instead of `[n_tokens, n_tokens, 1, 1]`, where
+  `n_tps = n_tokens / n_seqs_unq`.
+- `llm_graph_input_attn_no_cache::set_input`: when `equal_seqs`, fills `n_seqs_unq`
+  independent `n_tps × n_tps` blocks (one per sequence) instead of the flat
+  `n_tokens × n_tokens` cross-sequence matrix. This avoids the O(n_tokens²) cross-sequence
+  work and produces the block-diagonal structure naturally.
+- `build_attn` (no-cache overload): when `equal_seqs`, reshapes K and V from
+  `[head_dim, n_heads_kv, n_tokens, 1]` to `[head_dim, n_heads_kv, n_tps, n_seqs_unq]`
+  before passing to `build_attn_mha`. The existing `build_attn_mha` logic already splits Q
+  based on `k->ne[3]`, so it naturally computes attention independently per sequence/stream.
 
 ---
 
