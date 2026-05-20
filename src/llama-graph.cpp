@@ -156,8 +156,9 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer));
-        GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
+        // equal_seqs places tokens seq-major, but pos[i] and pos[j] remain valid
+        // for all tokens regardless of layout, so no special handling is needed.
         int32_t * data = (int32_t *) pos_bucket->data;
 
         for (int j = 0; j < n_tokens; ++j) {
@@ -553,8 +554,9 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cross_kq_mask->buffer));
-    GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
+    // equal_seqs places tokens seq-major, but seq_id[i] lookups are still valid
+    // for all token indices, so cross-attention mask filling needs no special handling.
     float * data = (float *) cross_kq_mask->data;
 
     for (int i = 0; i < n_tokens; ++i) {

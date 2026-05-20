@@ -51,7 +51,7 @@ output correct.
 
 ---
 
-## 3. Multi-Stream KV Cache: `equal_seqs` Path is Blocked
+## 3. Multi-Stream KV Cache: `equal_seqs` Path is Blocked ✅ DONE
 
 **Where:** `src/llama-kv-cache.cpp:1651–1655`, `src/llama-graph.cpp:159`, `src/llama-graph.cpp:2123`
 
@@ -64,6 +64,21 @@ is incompatible with the multi-stream KV cache layout. This forces the system to
 `llama-graph.cpp:2123`. When sequences are equal length, Q/K/V tensors can be streamed
 independently per sequence. This unlocks better parallelism for multi-sequence inference,
 important for server batch workloads.
+
+**Implemented:** Removed the three `GGML_ASSERT(!ubatch->equal_seqs())` guards:
+
+- `llm_graph_input_pos_bucket::set_input` (graph.cpp): The encoder self-attention pos-bucket
+  loop uses `ubatch->pos[i/j]` which is valid for any token layout; assert was overly
+  conservative.
+- `llm_graph_input_attn_cross::set_input` (graph.cpp): Cross-attention mask filling uses
+  `ubatch->seq_id[i]` lookups which are layout-independent; assert was overly conservative.
+- `llama_kv_cache::set_input_pos_bucket` (kv-cache.cpp): Rewrote to look up cells via
+  `v_cells[seq_to_stream[seq_id]]` per token instead of hard-coding `v_cells[0]`.  Also
+  removed the `n_stream == 1` guard, since the per-token stream lookup now handles both
+  single- and multi-stream correctly.
+
+The TODO at graph.cpp:2123 (n_seqs_unq-based Q/K/V tensor splitting for better GPU
+parallelism) is left as a future investigation; the linked PR noted it "might not be worth it."
 
 ---
 

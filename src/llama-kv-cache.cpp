@@ -1707,26 +1707,24 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    const int64_t n_tokens = ubatch->n_tokens;
-
-    GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
-    const auto & cells = v_cells[0];
-
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
-    int32_t * data = (int32_t *) dst->data;
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int32_t n_kv     = dst->ne[0];
+    int32_t *     data     = (int32_t *) dst->data;
 
-    const int32_t n_kv = dst->ne[0];
+    for (int i = 0; i < n_tokens; ++i) {
+        // For multi-stream (equal_seqs), each token belongs to exactly one sequence.
+        // Map it to the owning stream so the correct KV cells are used.
+        // For single-stream, seq_to_stream always maps to 0.
+        GGML_ASSERT(ubatch->n_seq_id[i] >= 1);
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-    for (int h = 0; h < 1; ++h) {
-        for (int i = 0; i < n_tokens; ++i) {
-            for (int j = 0; j < n_kv; ++j) {
-                // the position when the cells is empty is irrelevant - it will be masked out later in the attention
-                const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
-
-                data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
-            }
+        for (int j = 0; j < n_kv; ++j) {
+            // the position when the cell is empty is irrelevant — masked out during attention
+            const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
+            data[i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
         }
     }
 }
