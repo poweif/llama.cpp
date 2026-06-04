@@ -545,6 +545,8 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_memory_context_i * mctx_tgt        = nullptr; // target KV context for frozen-KV models (e.g. gemma4-assistant)
+    const ggml_tensor            * target_tok_embd  = nullptr; // target model's token embedding for gemma4-assistant
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -632,7 +634,12 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            // frozen-KV models (e.g. gemma4-assistant) use a placeholder graph when
+            // mctx_tgt is null and the real transformer graph when it is set.
+            // these two graphs have completely different topologies, so we must not reuse
+            // a graph built with one null-ness for the other.
+            (mctx_tgt != nullptr) == (other.mctx_tgt != nullptr);
     }
 };
 
@@ -762,6 +769,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_memory_context_i * mctx_tgt;       // target KV context for frozen-KV models
+    const ggml_tensor            * target_tok_embd; // target model's token embedding for gemma4-assistant
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

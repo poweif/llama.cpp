@@ -555,6 +555,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
+    // gemma4-assistant: global projection tensors for MTP draft head
+    struct ggml_tensor * nextn_pre_proj  = nullptr; // [2*n_backbone, n_embd]
+    struct ggml_tensor * nextn_post_proj = nullptr; // [n_embd, n_backbone]
+    struct ggml_tensor * rope_freqs      = nullptr; // global rope freq factors (no block ID)
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

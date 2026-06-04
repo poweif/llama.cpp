@@ -213,6 +213,10 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
     return std::make_unique<llama_kv_cache_iswa_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache_iswa::init_current() {
+    return std::make_unique<llama_kv_cache_iswa_context>(this, /*current_n_kv=*/true);
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }
@@ -257,6 +261,13 @@ llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv) :
     ctx_base(kv->get_base()->init_full()),
     ctx_swa (kv->get_swa ()->init_full()),
+    status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
+}
+
+llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
+        llama_kv_cache_iswa * kv, bool current_n_kv) :
+    ctx_base(current_n_kv ? kv->get_base()->init_current() : kv->get_base()->init_full()),
+    ctx_swa (current_n_kv ? kv->get_swa ()->init_current() : kv->get_swa ()->init_full()),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
 

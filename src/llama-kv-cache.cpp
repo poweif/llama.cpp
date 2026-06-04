@@ -726,6 +726,10 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_current() {
+    return std::make_unique<llama_kv_cache_context>(this, /*current_n_kv=*/true);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -2434,6 +2438,24 @@ llama_kv_cache_context::llama_kv_cache_context(
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
     }
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv, bool current_n_kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    const uint32_t n_stream = kv->get_n_stream();
+
+    sinfos.resize(1);
+    sinfos[0].s0 = 0;
+    sinfos[0].s1 = n_stream - 1;
+    sinfos[0].idxs.resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        sinfos[0].strm.push_back(s);
+        sinfos[0].idxs[s].resize(1, 0);
+    }
+
+    // For frozen-KV models: use the actual filled extent so attention only covers
+    // filled positions, not the entire pre-allocated context window.
+    n_kv = current_n_kv ? kv->get_n_kv(sinfos[0]) : kv->get_size();
 }
 
 llama_kv_cache_context::llama_kv_cache_context(

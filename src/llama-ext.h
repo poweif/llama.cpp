@@ -104,3 +104,13 @@ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// Check whether a model is a gemma4-assistant (frozen-KV MTP draft model)
+LLAMA_API bool llama_model_is_gemma4_assistant(const struct llama_model * model);
+
+// Link the assistant (draft) context to the target model's context for frozen-KV MTP.
+// Must be called before llama_decode() on the assistant context.
+// The target_ctx must use llama_kv_cache_iswa (e.g. Gemma4 main model).
+LLAMA_API void llama_set_mtp_target_ctx(
+    struct llama_context * assistant_ctx,
+    struct llama_context * target_ctx);

@@ -61,6 +61,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA3,
     LLM_ARCH_GEMMA3N,
     LLM_ARCH_GEMMA4,
+    LLM_ARCH_GEMMA4_ASSISTANT,
     LLM_ARCH_GEMMA_EMBEDDING,
     LLM_ARCH_STARCODER2,
     LLM_ARCH_MAMBA,
@@ -555,6 +556,8 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    LLM_TENSOR_NEXTN_PRE_PROJ,      // gemma4-assistant: global pre-projection
+    LLM_TENSOR_NEXTN_POST_PROJ,     // gemma4-assistant: global post-projection
 };
 
 enum llm_tensor_layer {

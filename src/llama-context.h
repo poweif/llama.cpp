@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-memory.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -15,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_kv_cache_iswa;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -137,6 +139,10 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // Link to the target model's KV cache for frozen-KV models (e.g. gemma4-assistant)
+    // Call before llama_decode(); the context does NOT take ownership of target_ctx.
+    void set_mtp_target_ctx(llama_context * target_ctx);
 
     //
     // state save/load
@@ -274,6 +280,13 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+
+    // For frozen-KV models (e.g. gemma4-assistant): reference to target model's KV cache.
+    // Non-owning pointers; must outlive this context.
+    llama_kv_cache_iswa *    mtp_target_kv_iswa   = nullptr;
+    const llama_model *      mtp_target_model      = nullptr; // for access to tok_embd etc.
+    // Holds the full-view memory context of the target KV cache for each decode call.
+    llama_memory_context_ptr mtp_tgt_mctx_holder;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

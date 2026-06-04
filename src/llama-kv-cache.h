@@ -121,6 +121,11 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // Like init_full() but n_kv reflects the actual filled extent, not the full
+    // allocated size.  Used by frozen-KV models (e.g. gemma4-assistant) to avoid
+    // computing attention over the entire (mostly empty) context every step.
+    llama_memory_context_ptr init_current();
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -321,9 +326,13 @@ public:
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
 
-    // used to create a full-cache context
+    // used to create a full-cache context (n_kv = kv->get_size())
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a current-state context (n_kv = actual filled extent, for frozen-KV)
+    llama_kv_cache_context(
+            llama_kv_cache * kv, bool current_n_kv);
 
     // used to create an update context
     llama_kv_cache_context(

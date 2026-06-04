@@ -94,6 +94,11 @@ struct llama_hparams {
 
     bool kv_only_nextn = false; // if true, only the last nextn_predict_layers blocks have a KV cache (MTP head arches)
 
+    // For gemma4-assistant: which target model KV layers to read frozen K/V from
+    // (determined at load time from the target model's SWA pattern)
+    int32_t tgt_il_swa    = -1; // target SWA layer index
+    int32_t tgt_il_global = -1; // target global (non-SWA) layer index
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
@@ -180,6 +185,11 @@ struct llama_hparams {
 
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
+
+    // input embedding dimension override for batch.embd stride (0 = use n_embd)
+    // set for models where batch.embd rows are wider than the model's internal n_embd
+    // (e.g. gemma4-assistant uses backbone dim = target n_embd for its embd input)
+    uint32_t n_embd_inp_impl = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

@@ -974,6 +974,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mctx_tgt         (params.mctx_tgt),
+    target_tok_embd  (params.target_tok_embd),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

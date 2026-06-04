@@ -1,4 +1,5 @@
 #include "models.h"
+#include "../llama-kv-cache-iswa.h"
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -454,4 +455,283 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     // permute to shape: [n_embd_per_layer, n_tokens, n_layer]
     inp_per_layer = ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
     return inp_per_layer;
+}
+
+//
+// llama_model_gemma4_assistant
+//
+// This is a separate MTP (multi-token prediction) assistant model for Gemma4.
+// It has its own token embeddings and transformer layers, but NO wk/wv weights.
+// Instead, it reads frozen K and V tensors from the target model's KV cache.
+//
+
+void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
+    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa, false);
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
+    ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa, false);
+    ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa, false);
+    // n_embd_out_impl stores the backbone embedding dimension (= target model's n_embd)
+    ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,        hparams.n_embd_out_impl, false);
+    // nextn_predict_layers is required for the MTP context type check to pass
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,        hparams.nextn_predict_layers, false);
+
+    // batch.embd rows for this model carry the backbone-dim hidden state (n_backbone = n_embd_out),
+    // not the internal n_embd.  Override n_embd_inp so that decode()'s batch splitter uses the
+    // correct stride when partitioning batch.embd into ubatch.embd rows.
+    if (hparams.n_embd_out_impl > 0) {
+        hparams.n_embd_inp_impl = hparams.n_embd_out_impl;
+    }
+
+    hparams.f_attention_scale = 1.0f;
+    // All layers share KV with target (no own KV cache)
+    hparams.n_layer_kv_from_start = 0;
+
+    // Target KV layer indices default to the last SWA/global layers of the standard
+    // Gemma4-26B 30-layer model.  These can be overridden via the GGUF if the target
+    // has a different number of layers.
+    hparams.tgt_il_swa    = 28; // last SWA layer in the 30-layer model
+    hparams.tgt_il_global = 29; // last global layer in the 30-layer model
+
+    type = LLM_TYPE_UNKNOWN;
+}
+
+void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader & /*ml*/) {
+    LLAMA_LOAD_LOCALS;
+
+    const int64_t n_backbone = hparams.n_embd_out(); // backbone embedding dim (= target n_embd)
+
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    if (output == nullptr) {
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+    }
+    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          0);
+
+    // Global pre/post projections: input [2*n_backbone] → internal [n_embd] and back
+    this->nextn_pre_proj  = create_tensor(tn(LLM_TENSOR_NEXTN_PRE_PROJ,  "weight"), {2*n_backbone, n_embd}, 0);
+    this->nextn_post_proj = create_tensor(tn(LLM_TENSOR_NEXTN_POST_PROJ, "weight"), {n_embd, n_backbone},   0);
+
+    // Optional rope frequency factors for global (non-SWA) attention layers.
+    // The GGUF stores this as "rope_freqs.weight" (no block ID).
+    // We use bid=0 to satisfy the LAYER_REPEATING constraint; the format string
+    // "rope_freqs" has no %d so the generated name is "rope_freqs.weight" regardless.
+    const int n_embd_head_global = hparams.n_embd_head_k(n_layer - 1); // last layer is global
+    this->rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", 0), {n_embd_head_global/2}, TENSOR_NOT_REQUIRED);
+
+    for (int i = 0; i < n_layer; ++i) {
+        auto & layer = layers[i];
+        const int64_t n_embd_head = hparams.n_embd_head_k(i);
+        const int64_t n_head      = hparams.n_head(i);
+        const int64_t n_ff_cur    = hparams.n_ff(i);
+
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd},                    0);
+        layer.wq             = create_tensor(tn(LLM_TENSOR_ATTN_Q,        "weight", i), {n_embd, n_embd_head*n_head}, 0);
+        // No wk / wv — uses frozen K/V from the target model's KV cache.
+        layer.wo             = create_tensor(tn(LLM_TENSOR_ATTN_OUT,      "weight", i), {n_embd_head*n_head, n_embd}, 0);
+        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,   "weight", i), {n_embd_head},                0);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM,"weight", i), {n_embd},                    0);
+        layer.out_scale      = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE,"weight",i), {1u},          TENSOR_NOT_REQUIRED);
+
+        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd},             0);
+        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
+        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd},        0);
+    }
+}
+
+std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_graph(
+        const llm_graph_params & params) const {
+    return std::make_unique<graph>(*this, params);
+}
+
+llama_model_gemma4_assistant::graph::graph(
+        const llama_model & model,
+        const llm_graph_params & params)
+    : llm_graph_context(params), model(model)
+{
+    const int64_t n_backbone = hparams.n_embd_out(); // backbone dim = target n_embd
+
+    // Build a placeholder graph when the target context is not yet linked
+    // (e.g., during graph reservation at startup before llama_set_mtp_target_ctx).
+    // We register inputs at their correct runtime shapes so the scheduler can
+    // reserve the right memory.  We avoid build_inp_embd() here because that
+    // helper produces a non-contiguous ggml_view_2d when n_embd_inp > n_embd,
+    // which would fail the ggml_is_contiguous assert in ggml_scale.
+    if (!mctx_tgt || !target_tok_embd) {
+        // Register token-ID and backbone-hidden inputs with the correct shapes.
+        // n_backbone is both the embd stride in the batch (set via n_embd_inp_impl)
+        // and the hidden-state dimension passed between draft steps.
+        auto inp = std::make_unique<llm_graph_input_embd>(n_backbone);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        cb(inp->tokens, "inp_tokens", -1);
+        ggml_set_input(inp->tokens);
+        res->t_inp_tokens = inp->tokens;
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_backbone, ubatch.n_tokens);
+        cb(inp->embd, "inp_mtp_hidden_ph", -1);
+        ggml_set_input(inp->embd);
+
+        res->add_input(std::move(inp));
+
+        // Minimal contiguous computation: tok_embd lookup [n_embd] → post_proj → [n_backbone].
+        // Uses res->t_inp_tokens so set_input() fills it with the warmup token IDs.
+        ggml_tensor * tok_out  = ggml_get_rows(ctx0, model.tok_embd, res->t_inp_tokens);
+        ggml_tensor * ph_embd  = ggml_mul_mat(ctx0, model.nextn_post_proj, tok_out);
+        cb(ph_embd, "result_mtp_embd", -1);
+        res->t_embd = ph_embd; // [n_backbone, n_tokens]
+        ggml_build_forward_expand(gf, ph_embd);
+
+        // Logits are skipped (left null) during placeholder — output_reserve()
+        // allocates the buffer but it won't be filled.
+        return;
+    }
+
+    const auto * tgt_kv_ctx = static_cast<const llama_kv_cache_iswa_context *>(mctx_tgt);
+    const auto * tgt_base   = tgt_kv_ctx->get_base(); // non-SWA layers
+    const auto * tgt_swa    = tgt_kv_ctx->get_swa();  // SWA layers
+
+    const int32_t tgt_il_swa    = hparams.tgt_il_swa;
+    const int32_t tgt_il_global = hparams.tgt_il_global;
+
+    // Create a combined input:
+    // - tokens:  [n_tokens] i32  - token IDs (used to look up target token embeddings)
+    // - embd:    [n_backbone, n_tokens] f32 - target hidden state (backbone dim)
+    //
+    // We use llm_graph_input_embd with n_embd = n_backbone so that set_input() copies
+    // the correct amount of data from batch.embd (which has backbone-dimension rows).
+    auto inp = std::make_unique<llm_graph_input_embd>(n_backbone);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    cb(inp->tokens, "inp_tokens", -1);
+    ggml_set_input(inp->tokens);
+    res->t_inp_tokens = inp->tokens;
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_backbone, ubatch.n_tokens);
+    cb(inp->embd, "inp_mtp_hidden", -1);
+    ggml_set_input(inp->embd);
+
+    ggml_tensor * hidden_state = inp->embd;  // [n_backbone, n_tokens]
+    ggml_tensor * raw_tokens   = inp->tokens; // [n_tokens] i32
+
+    res->add_input(std::move(inp));
+
+    // Target token embeddings for the current input tokens (from the target model's vocab)
+    ggml_tensor * tgt_tok_embd_cur = ggml_get_rows(ctx0, const_cast<ggml_tensor *>(target_tok_embd), raw_tokens);
+    tgt_tok_embd_cur = ggml_scale(ctx0, tgt_tok_embd_cur, sqrtf((float) n_backbone));
+    cb(tgt_tok_embd_cur, "inp_tgt_tok_embd", -1);
+
+    // Concatenate [scaled_tok_embd(n_backbone), hidden_state(n_backbone)] → [2*n_backbone]
+    ggml_tensor * combined = ggml_concat(ctx0, tgt_tok_embd_cur, hidden_state, 0);
+    cb(combined, "inp_combined", -1);
+
+    // Apply pre_projection: [2*n_backbone] → [n_embd]
+    ggml_tensor * cur = ggml_mul_mat(ctx0, model.nextn_pre_proj, combined);
+    cb(cur, "mtp_pre_proj", -1);
+
+    ggml_tensor * inp_pos = build_inp_pos();
+    ggml_tensor * inpL    = cur;
+
+    for (int il = 0; il < n_layer; ++il) {
+        const int64_t n_embd_head = hparams.n_embd_head_k(il);
+        const int64_t n_head      = hparams.n_head(il);
+        const bool    is_swa      = hparams.is_swa(il);
+
+        // 1. pre-attention norm
+        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        // 2. Q projection + norm + RoPE
+        ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+        Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "Qcur_normed", il);
+
+        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
+        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+        const int   n_rot_l      = hparams.n_rot(il);
+        // Use rope_freqs for global (non-SWA) layers like Gemma4 main model does
+        ggml_tensor * freq_factors = !is_swa ? model.rope_freqs : nullptr;
+        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors,
+                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Qcur, "Qcur_pos", il);
+
+        // 3. Frozen K and V from the target model's KV cache.
+        const auto * tgt_kv  = is_swa ? tgt_swa  : tgt_base;
+        const int32_t tgt_il = is_swa ? tgt_il_swa : tgt_il_global;
+        GGML_ASSERT(tgt_il >= 0);
+
+        ggml_tensor * K = tgt_kv->get_k(ctx0, tgt_il);
+        ggml_tensor * V = tgt_kv->get_v(ctx0, tgt_il);
+
+        // 4. Multi-head attention (no KQ mask: draft tokens attend to all target positions)
+        const float kq_scale = hparams.f_attention_scale > 0.0f
+                ? hparams.f_attention_scale
+                : (1.0f / sqrtf((float) n_embd_head));
+
+        cur = build_attn_mha(Qcur, K, V,
+                /*kq_b=*/   nullptr,
+                /*kq_mask=*/nullptr,
+                /*sinks=*/  nullptr,
+                /*v_mla=*/  nullptr,
+                kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        // 5. output projection
+        cur = build_lora_mm(model.layers[il].wo, cur);
+
+        // 6. post-attention norm + residual
+        cur = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_post_norm", il);
+        ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
+        cb(attn_out, "attn_out", il);
+
+        // 7. FFN (GELU gated)
+        cur = build_norm(attn_out, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "ffn_norm", il);
+        cur = build_ffn(cur,
+                model.layers[il].ffn_up,   nullptr, nullptr,
+                model.layers[il].ffn_gate, nullptr, nullptr,
+                model.layers[il].ffn_down, nullptr, nullptr,
+                nullptr,
+                LLM_FFN_GELU, LLM_FFN_PAR, il);
+        cb(cur, "ffn_out", il);
+
+        // 8. post-FFN norm + residual
+        cur = build_norm(cur, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "ffn_post_norm", il);
+        cur = ggml_add(ctx0, cur, attn_out);
+
+        // 9. per-layer output scale (optional)
+        if (model.layers[il].out_scale) {
+            cur = ggml_mul(ctx0, cur, model.layers[il].out_scale);
+            cb(cur, "out_scaled", il);
+        }
+
+        inpL = cur;
+    }
+
+    cur = inpL;
+
+    // LM head from internal representation [n_embd]
+    ggml_tensor * cur_norm = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur_norm, "result_norm", -1);
+
+    ggml_tensor * logits = build_lora_mm(model.output, cur_norm);
+    cb(logits, "result_output", -1);
+    res->t_logits = logits;
+
+    // Post-projection: internal [n_embd] → backbone [n_backbone]
+    // This is the "backbone embedding" returned as the hidden state for the next draft step.
+    // It's exposed via res->t_embd (which llama_get_embeddings_ith reads).
+    ggml_tensor * mtp_embd = ggml_mul_mat(ctx0, model.nextn_post_proj, cur);
+    cb(mtp_embd, "result_mtp_embd", -1);
+    res->t_embd = mtp_embd; // [n_backbone, n_tokens]
+
+    ggml_build_forward_expand(gf, logits);
+    ggml_build_forward_expand(gf, mtp_embd);
 }

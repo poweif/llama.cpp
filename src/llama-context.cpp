@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -1626,6 +1627,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // Refresh the target KV context for frozen-KV models (e.g. gemma4-assistant).
+    // Use init_current() (not init_full()) so n_kv reflects only the filled positions;
+    // init_full() would use the full allocated context size causing attention to be
+    // computed over thousands of empty KV slots.
+    if (mtp_target_kv_iswa) {
+        mtp_tgt_mctx_holder = mtp_target_kv_iswa->init_current();
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2295,13 +2304,34 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
+        /*.mctx           =*/ mctx,
+        /*.cross          =*/ &cross,
+        /*.mctx_tgt       =*/ mtp_tgt_mctx_holder.get(),
+        /*.target_tok_embd=*/ mtp_target_model ? mtp_target_model->tok_embd : nullptr,
+        /*.samplers       =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+void llama_context::set_mtp_target_ctx(llama_context * target_ctx) {
+    if (!target_ctx) {
+        mtp_target_kv_iswa = nullptr;
+        mtp_target_model   = nullptr;
+        mtp_tgt_mctx_holder.reset();
+        sched_need_reserve = true;
+        return;
+    }
+    auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(target_ctx->memory.get());
+    if (!kv_iswa) {
+        LLAMA_LOG_WARN("%s: target context does not use llama_kv_cache_iswa; gemma4-assistant may not work\n", __func__);
+    }
+    mtp_target_kv_iswa = kv_iswa;
+    mtp_target_model   = &target_ctx->model;
+    // Force scheduler re-reservation: the graph topology changes from the placeholder
+    // (built when mctx_tgt was null) to the full frozen-KV transformer graph.
+    sched_need_reserve = true;
 }
 
 ggml_status llama_context::graph_compute(
@@ -3598,6 +3628,14 @@ float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_pre_norm_ith(i);
+}
+
+bool llama_model_is_gemma4_assistant(const llama_model * model) {
+    return model && model->arch == LLM_ARCH_GEMMA4_ASSISTANT;
+}
+
+void llama_set_mtp_target_ctx(llama_context * assistant_ctx, llama_context * target_ctx) {
+    assistant_ctx->set_mtp_target_ctx(target_ctx);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

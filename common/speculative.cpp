@@ -416,7 +416,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
-    int32_t n_embd = 0;
+    int32_t n_embd        = 0; // draft model's internal n_embd
+    int32_t n_embd_hidden = 0; // hidden state dimension (= target n_embd for gemma4-assistant)
+
+    // True when the draft model is a gemma4-assistant (frozen-KV model that uses
+    // its own token embeddings, not pre-norm hidden states from the target).
+    bool is_gemma4_asst = false;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -444,10 +449,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
+        is_gemma4_asst = llama_model_is_gemma4_assistant(llama_get_model(ctx_dft));
+
         n_embd = llama_model_n_embd(llama_get_model(ctx_dft));
 
+        // For gemma4-assistant: the hidden state dimension is the TARGET's n_embd (backbone dim),
+        // not the assistant's internal n_embd.
+        n_embd_hidden = is_gemma4_asst
+                ? llama_model_n_embd(llama_get_model(ctx_tgt))
+                : n_embd;
+
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, n_embd_hidden=%d, backend_sampling=%d, gemma4_asst=%d\n",
+                __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, n_embd_hidden,
+                (int) this->params.backend_sampling, (int) is_gemma4_asst);
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n", __func__,
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -457,11 +472,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
-        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
-        // llama_batch_init allocates only one of token/embd; MTP needs both.
-        // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        // Gemma4 assistant: batch needs BOTH token IDs AND hidden states (backbone dim).
+        // Other MTP: batch needs token IDs + target hidden state (same n_embd).
+        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_hidden, /*n_seq_max=*/ 1);
+        if (is_gemma4_asst) {
+            // llama_batch_init only allocates embd; we also need token IDs.
+            batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+            // Link draft to target for frozen-KV access.
+            llama_set_mtp_target_ctx(ctx_dft, ctx_tgt);
+        } else {
+            // Standard MTP: llama_batch_init allocates only one of token/embd; MTP needs both.
+            // TODO: fix, how to call without malloc
+            batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        }
+
+        // Store backbone hidden dim for use in process()/draft()
+        // (reuse pending_h with the appropriate dimension)
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -487,10 +514,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // Both regular MTP and gemma4-assistant need the target's pre-norm embeddings.
         llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+        if (is_gemma4_asst) {
+            // Gemma4 assistant: expose backbone embd via llama_get_embeddings_ith(ctx_dft, i)
+            // (res->t_embd = mtp_post_projection output, backbone dim)
+            llama_set_embeddings(ctx_dft, true);
+        } else {
+            llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+        }
 
-        pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_h.assign(n_seq, std::vector<float>(n_embd_hidden, 0.0f));
 
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
@@ -514,27 +548,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         backend_chains.clear();
 
-        if (batch.token != nullptr) {
+        if (!is_gemma4_asst && batch.token != nullptr) {
             free(batch.token);
             batch.token = nullptr;
         }
         llama_batch_free(batch);
     }
 
-    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        const int32_t N = (int32_t) prompt.size();
-        if (N <= 0) {
-            return;
-        }
-        auto * ctx_dft = this->params.ctx_dft;
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-        if (pos_max < N - 1) {
-            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - "
-                    "process() hook may not have run on every prefill ubatch "
-                    "(need_embd / logits=1 on every prompt position?). "
-                    "Drafts may degrade.\n",
-                    __func__, (int) pos_max, N - 1);
-        }
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        // gemma4-assistant: nothing to do (uses frozen KV from target directly).
+        // Other MTP: the pos_max check is skipped here; the check in process() guards adequately.
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -544,6 +567,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        // Gemma4 assistant: the draft model reads frozen K/V from the target and has no
+        // own KV cache to update.  We only need to harvest the target's pre-norm hidden
+        // states and stash them in pending_h / verify_h for use in draft().
+        // There is no reason to call llama_decode(ctx_dft) here — its outputs are never
+        // read in process(), and doing so triggers a spurious "embeddings required" warning
+        // because the batch logit flags don't match cparams.embeddings on ctx_dft.
+        if (is_gemma4_asst) {
+            const int32_t n_tokens = batch_in.n_tokens;
+            const size_t row_bytes_h = (size_t) n_embd_hidden * sizeof(float);
+
+            std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+            std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+            for (int k = 0; k < n_tokens; ++k) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (batch_in.n_seq_id[k] == 1 && batch_in.seq_id[k][0] == seq_id) {
+                        i_batch_end[seq_id] = k;
+                        if (i_batch_beg[seq_id] < 0) {
+                            i_batch_beg[seq_id] = k;
+                        }
+                    }
+                }
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) continue;
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                verify_h_rows[seq_id] = n_rows;
+                verify_h[seq_id].resize((size_t) n_rows * n_embd_hidden);
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd_hidden, h, row_bytes_h);
+                }
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd_hidden, row_bytes_h);
+            }
             return true;
         }
 
@@ -566,9 +630,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
-
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         common_batch_clear(batch);
@@ -585,15 +646,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         {
             const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-
-            //{
-            //    // string with seq_ids in the batch
-            //    std::stringstream ss;
-            //    for (int i = 0; i < n_tokens; ++i) {
-            //        ss << batch_in.seq_id[i][0] << ",";
-            //    }
-            //    LOG_WRN("%s: batch_in.seq_id = %s\n", __func__, ss.str().c_str());
-            //}
         }
 
         // fill the pending embeddings from a previous run
@@ -641,7 +693,114 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         common_batch_clear(batch);
 
+        if (is_gemma4_asst) {
+            // Gemma4 assistant: multi-step drafting with backbone hidden state transfer.
+            // Each step uses:
+            //   - batch.token = current token ID
+            //   - batch.embd  = backbone hidden state (from pending_h or previous draft output)
+            // After each step, the backbone embedding output (res->t_embd) is used as
+            // the hidden state for the next step (via llama_get_embeddings_ith).
+
+            const size_t row_bytes_h = (size_t) n_embd_hidden * sizeof(float);
+            // Per-seq hidden state for draft generation (starts from pending_h)
+            std::vector<std::vector<float>> draft_h(n_seq, std::vector<float>(n_embd_hidden));
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                std::memcpy(draft_h[seq_id].data(), pending_h[seq_id].data(), row_bytes_h);
+            }
+
+            int n_drafting = 0;
+            std::vector<bool> drafting(n_seq);
+            std::vector<int32_t> i_batch_map(n_seq, -1); // seq_id → batch index
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) continue;
+                n_drafting++;
+                drafting[seq_id] = true;
+                common_sampler_reset(smpls[seq_id].get());
+                i_batch_map[seq_id] = (int32_t) batch.n_tokens;
+                common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+                // Fill batch.embd for this token with the pending backbone hidden state
+                std::memcpy(batch.embd + (size_t) i_batch_map[seq_id] * n_embd_hidden,
+                        draft_h[seq_id].data(), row_bytes_h);
+            }
+
+            int ret = llama_decode(ctx_dft, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode (gemma4-asst) returned %d\n", __func__, ret);
+                goto done;
+            }
+
+            // Extract backbone embeddings for next step
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) continue;
+                const float * emb = llama_get_embeddings_ith(ctx_dft, i_batch_map[seq_id]);
+                if (emb) std::memcpy(draft_h[seq_id].data(), emb, row_bytes_h);
+            }
+
+            for (int i = 0; n_drafting > 0; ++i) {
+                int i_batch = 0;
+                common_batch_clear(batch);
+                std::fill(i_batch_map.begin(), i_batch_map.end(), -1);
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (!drafting[seq_id]) continue;
+
+                    auto * smpl = smpls[seq_id].get();
+                    // Sample from the previous decode output at the position for this seq
+                    common_sampler_sample(smpl, ctx_dft, i_batch, true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    const llama_token id = cur_p->data[0].id;
+
+                    if (cur_p->data[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        ++i_batch;
+                        continue;
+                    }
+
+                    common_sampler_accept(smpl, id, true);
+                    ++i_batch;
+
+                    auto & dp    = dparams.at(seq_id);
+                    auto & result = *dp.result;
+                    result.push_back(id);
+
+                    if (params.n_max <= (int) result.size()) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+
+                    i_batch_map[seq_id] = (int32_t) batch.n_tokens;
+                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+                    // Use the backbone embedding from the previous step as hidden state
+                    std::memcpy(batch.embd + (size_t) i_batch_map[seq_id] * n_embd_hidden,
+                            draft_h[seq_id].data(), row_bytes_h);
+                }
+
+                if (batch.n_tokens == 0) break;
+
+                ret = llama_decode(ctx_dft, batch);
+                if (ret != 0) {
+                    LOG_WRN("%s: llama_decode[%d] (gemma4-asst) returned %d\n", __func__, i, ret);
+                    break;
+                }
+
+                // Extract backbone embeddings for the next draft step
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (!drafting[seq_id] || i_batch_map[seq_id] < 0) continue;
+                    const float * emb = llama_get_embeddings_ith(ctx_dft, i_batch_map[seq_id]);
+                    if (emb) std::memcpy(draft_h[seq_id].data(), emb, row_bytes_h);
+                }
+            }
+
+            goto done;
+        }
+
         // keep track of which sequences are still drafting
+        {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
@@ -668,7 +827,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
-            return;
+            goto done;
         }
 
         int i = 0;
@@ -738,7 +897,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             ++i;
         }
+        } // end non-gemma4 block
 
+        done:
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -754,6 +915,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (is_gemma4_asst) {
+            return; // gemma4-assistant has no hidden state to carry over
+        }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -773,7 +937,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool need_embd_pre_norm() const override {
-        return true;
+        return true; // both regular MTP and gemma4-assistant need target pre-norm embeddings
     }
 };
 

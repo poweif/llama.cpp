@@ -41,6 +41,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // Like init_full() but both sub-caches use actual filled n_kv (for frozen-KV models)
+    llama_memory_context_ptr init_current();
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -86,9 +89,13 @@ public:
     // used for errors
     llama_kv_cache_iswa_context(llama_memory_status status);
 
-    // used to create a full-cache context
+    // used to create a full-cache context (n_kv = allocated size)
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv);
+
+    // used to create a current-state context (n_kv = actual filled extent, for frozen-KV)
+    llama_kv_cache_iswa_context(
+            llama_kv_cache_iswa * kv, bool current_n_kv);
 
     // used to create an update context
     llama_kv_cache_iswa_context(
