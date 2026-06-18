@@ -26,6 +26,8 @@ fi
 if (( use_gemma_mtp )); then
     args=(
 	-m /home/poweif/models/gemma-4-26B-A4B-it-Q8_0.gguf
+	--mmproj /home/poweif/models/mmproj-gemma-4-26B-A4B-it-Q8_0.gguf
+	--mmproj-offload
 	-md /home/poweif/models/gemma-4-26B-A4B-it-assistant-Q8_0.gguf
 	--spec-type draft-mtp
 	--spec-draft-n-max 3
@@ -81,11 +83,13 @@ else
     #-m /home/poweif/models/gemma-4-31B-it-Q8_0.gguf	
     args=(
 	-m /home/poweif/models/gemma-4-26B-A4B-it-Q8_0.gguf
+	--mmproj /home/poweif/models/mmproj-gemma-4-26B-A4B-it-Q8_0.gguf # allow for image input (multi-modal)
 	-ngl 99          # offload all layers to GPU
+	--mmproj-offload # offload vision encoder to GPU as well
 	-fa on           # flash attention: faster, lower VRAM on long contexts
-	-c 262144        # max context length (tokens)
+	-c 131072        # max context length (tokens)
 	-n 16384         # max tokens to generate per request
-	-b 4096          # prompt batch size: larger = faster ingestion, more VRAM
+	-b 8192          # prompt batch size: larger = faster ingestion, more VRAM
 	-ub 512          # micro-batch size: smaller = lower latency per decode step
 	--no-context-shift  # error on context overflow instead of silently rotating the window
 	--cache-reuse 256   # reuse KV cache for requests sharing a 256-token prefix (system prompt, file context)
@@ -96,10 +100,10 @@ else
 	# --cache-idle-slots is on by default but silently no-ops without --cache-ram.
 	# With it active, KV state from finished conversations is offloaded to RAM and
 	# freed from the main buffer, preventing unbounded memory growth over time.
-	--cache-ram 4096
+	--cache-ram 16384
 	# Trigger KV cache defragmentation when 10% of cells are fragmented.
 	# Deprecated flag but still functional; reduces fragmentation-driven bloat.
-	--defrag-thold 0.1
+	--defrag-thold 0.4
     )
 fi
 
