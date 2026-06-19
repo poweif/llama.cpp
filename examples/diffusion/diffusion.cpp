@@ -489,7 +489,7 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
     llama_batch batch = llama_batch_init(params.max_length, 0, 1);
 
     // Cached path: PREFILL the prompt once (writing the prefix K/V store), then each step DECODE only the
-    // canvas, reading the cached prefix - instead of re-decoding [prompt|canvas] every step. The packed
+    // canvas, reading the cached prefix - instead of re-decoding [prompt|canvas] every step. In both paths
     // canvas logits then start at row 0 (cached) instead of row n_input (unified).
     const int32_t logit_off = params.kv_cache ? 0 : n_input;
     if (params.kv_cache) {
