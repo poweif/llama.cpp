@@ -896,6 +896,17 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
+    vk_pipeline pipeline_diffusion_sample;
+
+    // Per-device scratch state for ggml_backend_vk_diffusion_sample().
+    // Grow-only device-local buffers + a dedicated descriptor pool/set.
+    vk::DescriptorPool diffusion_desc_pool;
+    vk::DescriptorSet  diffusion_desc_set;
+    vk_buffer          diffusion_u_buf;
+    vk_buffer          diffusion_argmax_buf;
+    vk_buffer          diffusion_entropy_buf;
+    vk_buffer          diffusion_sampled_buf;
+    int                diffusion_scratch_cap = 0;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -968,6 +979,15 @@ struct vk_device_struct {
             ggml_vk_destroy_pipeline(device, pl);
         }
         all_pipelines.clear();
+
+        if (diffusion_desc_pool) {
+            device.destroyDescriptorPool(diffusion_desc_pool);
+            diffusion_desc_pool = nullptr;
+        }
+        ggml_vk_destroy_buffer(diffusion_u_buf);
+        ggml_vk_destroy_buffer(diffusion_argmax_buf);
+        ggml_vk_destroy_buffer(diffusion_entropy_buf);
+        ggml_vk_destroy_buffer(diffusion_sampled_buf);
 
         device.destroyDescriptorSetLayout(dsl);
 
@@ -5116,6 +5136,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
+    // Diffusion on-device sampling: 5 storage buffers, 12-byte push constants,
+    // dispatch (n_tokens,1,1) workgroups of 256 threads each (fixed in shader).
+    {
+        struct vk_diffusion_sample_pc { uint32_t n_vocab, n_tokens; float inv_temp; };
+        ggml_vk_create_pipeline(device, device->pipeline_diffusion_sample, "diffusion_sample",
+            diffusion_sample_len, diffusion_sample_data, "main",
+            5, sizeof(vk_diffusion_sample_pc), {1, 1, 1}, {}, 0);
+    }
+
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     // Intel Arc B390 was observed segfaulting with this shader.
     if (device->subgroup_basic && device->subgroup_shuffle && device->vendor_id != VK_VENDOR_ID_INTEL) {
@@ -6227,6 +6256,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
         ggml_vk_load_shaders(device);
+
+        // Force-compile the diffusion sampling pipeline now; it is never scheduled
+        // through the ggml graph so lazy compilation would never fire.
+        if (device->pipeline_diffusion_sample) {
+            ggml_vk_load_shaders(device, device->pipeline_diffusion_sample);
+        }
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
@@ -17318,11 +17353,136 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// ---------------------------------------------------------------------------
+// On-device diffusion sampling (exposed via proc-address as
+// "ggml_backend_cuda_diffusion_sample" so diffusion-gemma.cpp can find it
+// the same way it finds the CUDA/ROCm implementation).
+// ---------------------------------------------------------------------------
+static bool ggml_backend_vk_diffusion_sample(
+        struct ggml_tensor * logits,
+        const float        * u_host,
+        int                * argmax_host,
+        float              * entropy_host,
+        int                * sampled_host,
+        int                  n_tokens,
+        float                inv_temp) {
+
+    if (!logits || !u_host || !argmax_host || !entropy_host || !sampled_host || n_tokens <= 0) {
+        return false;
+    }
+    if (logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits)) {
+        return false;
+    }
+    if (!logits->buffer || ggml_backend_buffer_is_host(logits->buffer)) {
+        return false;
+    }
+
+    const int n_vocab = (int)logits->ne[0];
+    if (n_vocab <= 0 || (int)ggml_nrows(logits) < n_tokens) {
+        return false;
+    }
+
+    auto * buf_ctx = (ggml_backend_vk_buffer_context *)logits->buffer->context;
+    vk_device device = buf_ctx->dev_buffer->device;
+
+    if (!device->pipeline_diffusion_sample || !device->pipeline_diffusion_sample->compiled) {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(device->mutex);
+
+    // Create descriptor pool/set on first call.
+    if (!device->diffusion_desc_pool) {
+        vk::DescriptorPoolSize dps(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT);
+        vk::DescriptorPoolCreateInfo dpci({}, 1u, dps);
+        device->diffusion_desc_pool = device->device.createDescriptorPool(dpci);
+        vk::DescriptorSetAllocateInfo dsai(device->diffusion_desc_pool, 1u, &device->dsl);
+        device->diffusion_desc_set = device->device.allocateDescriptorSets(dsai)[0];
+    }
+
+    // Grow scratch buffers on first call or when n_tokens exceeds current capacity.
+    if (device->diffusion_scratch_cap < n_tokens) {
+        const int new_cap = std::max(n_tokens, 512);
+        ggml_vk_destroy_buffer(device->diffusion_u_buf);
+        ggml_vk_destroy_buffer(device->diffusion_argmax_buf);
+        ggml_vk_destroy_buffer(device->diffusion_entropy_buf);
+        ggml_vk_destroy_buffer(device->diffusion_sampled_buf);
+        device->diffusion_u_buf       = ggml_vk_create_buffer_device(device, (size_t)new_cap * sizeof(float));
+        device->diffusion_argmax_buf  = ggml_vk_create_buffer_device(device, (size_t)new_cap * sizeof(int));
+        device->diffusion_entropy_buf = ggml_vk_create_buffer_device(device, (size_t)new_cap * sizeof(float));
+        device->diffusion_sampled_buf = ggml_vk_create_buffer_device(device, (size_t)new_cap * sizeof(int));
+        device->diffusion_scratch_cap = new_cap;
+    }
+
+    // Upload u[] (uniform randoms) to the device.
+    ggml_vk_buffer_write(device->diffusion_u_buf, 0, u_host, (size_t)n_tokens * sizeof(float));
+
+    // Get the logits buffer handle and byte offset within it.
+    vk_buffer logits_vkbuf = buf_ctx->dev_buffer;
+    const size_t logits_off = vk_tensor_offset(logits) + logits->view_offs;
+
+    // Update descriptor set bindings for this dispatch.
+    const std::array<vk::DescriptorBufferInfo, 5> dbi = {{
+        {logits_vkbuf->buffer,                   logits_off, (vk::DeviceSize)((size_t)n_tokens * (size_t)n_vocab * sizeof(float))},
+        {device->diffusion_u_buf->buffer,       0,          (vk::DeviceSize)((size_t)n_tokens * sizeof(float))},
+        {device->diffusion_argmax_buf->buffer,  0,          (vk::DeviceSize)((size_t)n_tokens * sizeof(int))},
+        {device->diffusion_entropy_buf->buffer, 0,          (vk::DeviceSize)((size_t)n_tokens * sizeof(float))},
+        {device->diffusion_sampled_buf->buffer, 0,          (vk::DeviceSize)((size_t)n_tokens * sizeof(int))},
+    }};
+    vk::WriteDescriptorSet wds{device->diffusion_desc_set, 0, 0, 5,
+                               vk::DescriptorType::eStorageBuffer, nullptr, dbi.data()};
+    device->device.updateDescriptorSets({wds}, {});
+
+    // Push constants: must match the layout in diffusion_sample.comp.
+    struct { uint32_t n_vocab, n_tokens; float inv_temp; } pc {
+        (uint32_t)n_vocab, (uint32_t)n_tokens, inv_temp
+    };
+
+    // Record and submit a single compute dispatch.
+    vk_context subctx = ggml_vk_create_temporary_context(device->compute_queue.cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+
+    auto & cmd = subctx->s->buffer->buf;
+    cmd.pushConstants(device->pipeline_diffusion_sample->layout,
+                      vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute,
+                     device->pipeline_diffusion_sample->pipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                           device->pipeline_diffusion_sample->layout,
+                           0, {device->diffusion_desc_set}, {});
+    cmd.dispatch((uint32_t)n_tokens, 1u, 1u);
+
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, device->fence);
+
+    VK_CHECK(device->device.waitForFences({device->fence}, true, UINT64_MAX),
+             "vk_diffusion_sample waitForFences");
+    device->device.resetFences({device->fence});
+    ggml_vk_queue_command_pools_cleanup(device);
+
+    // Read results back to host.
+    ggml_vk_buffer_read(device->diffusion_argmax_buf,  0, argmax_host,  (size_t)n_tokens * sizeof(int));
+    ggml_vk_buffer_read(device->diffusion_entropy_buf, 0, entropy_host, (size_t)n_tokens * sizeof(float));
+    ggml_vk_buffer_read(device->diffusion_sampled_buf, 0, sampled_host, (size_t)n_tokens * sizeof(int));
+
+    return true;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    // Expose diffusion sampling under the same name as the CUDA backend so that
+    // llama_diffusion_device_sample() finds it with a uniform lookup.
+    if (strcmp(name, "ggml_backend_cuda_diffusion_sample") == 0) {
+        return (void *)ggml_backend_vk_diffusion_sample;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

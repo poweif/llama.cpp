@@ -662,12 +662,26 @@ bool llama_diffusion_device_sample(const struct llama_model * model, const float
     if (!dm || dm->sc_dev == nullptr || !u || !argmax || !entropy || !sampled || n_tokens <= 0) {
         return false;
     }
-    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
-    if (!reg) {
-        return false;
+    static dg_cuda_sample_fn fn = nullptr;
+    if (!fn) {
+        ggml_backend_buffer_type_t logits_buft = dm->sc_dev->buffer
+            ? ggml_backend_buffer_get_type(dm->sc_dev->buffer) : nullptr;
+        for (const char * backend : {"CUDA", "ROCm", "Vulkan"}) {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name(backend);
+            if (!reg) { continue; }
+            // Only use this backend if the logits buffer is actually on one of its devices.
+            bool on_this_backend = false;
+            for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+                if (ggml_backend_dev_buffer_type(ggml_backend_reg_dev_get(reg, i)) == logits_buft) {
+                    on_this_backend = true;
+                    break;
+                }
+            }
+            if (!on_this_backend) { continue; }
+            fn = (dg_cuda_sample_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample");
+            if (fn) { break; }
+        }
     }
-    static dg_cuda_sample_fn fn =
-        (dg_cuda_sample_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample");
     if (!fn) {
         return false;
     }

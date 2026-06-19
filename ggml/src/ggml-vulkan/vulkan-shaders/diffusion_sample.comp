@@ -1,0 +1,154 @@
+// On-device diffusion sampling: argmax, entropy, and multinomial draw per canvas row.
+// Mirrors ggml_cuda_diffusion_sample / diffusion_dense_sample_kernel in ggml-cuda.
+// One workgroup (256 threads) per canvas token; all rows run in parallel.
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint  n_vocab;   // vocabulary size (e.g. 262144)
+    uint  n_tokens;  // canvas positions to process
+    float inv_temp;  // 1.0 / temperature
+} pc;
+
+// binding 0: logits[n_tokens * n_vocab], row-major, F32
+layout(binding = 0) readonly  buffer Logits  { float data[]; } logits_buf;
+// binding 1: uniform random values per token
+layout(binding = 1) readonly  buffer U       { float data[]; } u_buf;
+// binding 2-4: outputs (written by thread 0 or crossing thread)
+layout(binding = 2) writeonly buffer Argmax  { int   data[]; } argmax_buf;
+layout(binding = 3) writeonly buffer Entropy { float data[]; } entropy_buf;
+layout(binding = 4) writeonly buffer Sampled { int   data[]; } sampled_buf;
+
+// Shared memory — reused across phases to keep footprint small:
+//   phase 1 : s_val = local max, s_idx = local argmax
+//   phase 2 : s_val = T contributions, s_sum = Z contributions
+//   phase 3 : s_sum = per-slice exp-sums, s_val[0] = prefix at crossing,
+//              s_idx[0] = crossing slice id
+shared float s_val[256];
+shared int   s_idx[256];
+shared float s_sum[256];
+shared int   s_tok;   // output sampled token (written by crossing thread, read by thread 0)
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint bdim = 256u;
+
+    if (row >= pc.n_tokens) { return; }
+
+    const uint base = row * pc.n_vocab;
+
+    // -----------------------------------------------------------------------
+    // Phase 1: find global max and argmax over the vocab (numerical stability)
+    // -----------------------------------------------------------------------
+    float local_max = -3.402823466e+38;
+    int   local_idx = 0;
+
+    [[unroll]] for (uint v = tid; v < pc.n_vocab; v += bdim) {
+        float x = logits_buf.data[base + v] * pc.inv_temp;
+        if (x > local_max) { local_max = x; local_idx = int(v); }
+    }
+    s_val[tid] = local_max;
+    s_idx[tid] = local_idx;
+    barrier();
+
+    [[unroll]] for (int s = int(bdim) >> 1; s > 0; s >>= 1) {
+        if (int(tid) < s && s_val[tid + uint(s)] > s_val[tid]) {
+            s_val[tid] = s_val[tid + uint(s)];
+            s_idx[tid] = s_idx[tid + uint(s)];
+        }
+        barrier();
+    }
+    const float max_l = s_val[0];
+    const int   amax  = s_idx[0];
+
+    // -----------------------------------------------------------------------
+    // Phase 2: partition function Z and entropy numerator T
+    //   Z = sum_v exp(d_v), d_v = logit_v * inv_temp - max_l
+    //   T = sum_v d_v * exp(d_v)   →   entropy = log(Z) - T/Z
+    // s_sum accumulates Z, s_val accumulates T (reused from phase 1)
+    // -----------------------------------------------------------------------
+    float local_sum = 0.0;
+    float local_t   = 0.0;
+
+    [[unroll]] for (uint v = tid; v < pc.n_vocab; v += bdim) {
+        float d = logits_buf.data[base + v] * pc.inv_temp - max_l;
+        float e = exp(d);
+        local_sum += e;
+        local_t   += d * e;
+    }
+    s_sum[tid] = local_sum;
+    s_val[tid] = local_t;
+    barrier();
+
+    [[unroll]] for (int s = int(bdim) >> 1; s > 0; s >>= 1) {
+        if (int(tid) < s) {
+            s_sum[tid] += s_sum[tid + uint(s)];
+            s_val[tid] += s_val[tid + uint(s)];
+        }
+        barrier();
+    }
+    const float Z = s_sum[0];
+    const float T = s_val[0];
+
+    if (tid == 0u) {
+        argmax_buf.data[row]  = amax;
+        entropy_buf.data[row] = log(Z) - T / Z;
+        s_tok = int(pc.n_vocab) - 1;  // default: last token (guard against FP rounding)
+    }
+    barrier();
+
+    // -----------------------------------------------------------------------
+    // Phase 3: multinomial draw
+    // Split vocab into 256 equal chunks; each thread sums exp values in its chunk.
+    // Thread 0 exclusive-scans the 256 chunk sums to locate the crossing chunk.
+    // The crossing thread walks its chunk serially to find the exact token.
+    // -----------------------------------------------------------------------
+    const float r     = u_buf.data[row] * Z;
+    const uint  chunk = (pc.n_vocab + bdim - 1u) / bdim;
+    const uint  beg   = tid * chunk;
+    const uint  end   = min(beg + chunk, pc.n_vocab);
+
+    float slice_sum = 0.0;
+    [[unroll]] for (uint v = beg; v < end; v++) {
+        slice_sum += exp(logits_buf.data[base + v] * pc.inv_temp - max_l);
+    }
+    s_sum[tid] = slice_sum;
+    barrier();
+
+    // Thread 0: find crossing chunk via exclusive scan (256 iterations, cheap)
+    if (tid == 0u) {
+        s_idx[0] = -1;
+        float pref = 0.0;
+        for (uint i = 0u; i < bdim; i++) {
+            float next = pref + s_sum[i];
+            if (next >= r) {
+                s_idx[0] = int(i);
+                s_val[0] = pref;  // prefix sum up to (but not including) chunk i
+                break;
+            }
+            pref = next;
+        }
+    }
+    barrier();
+
+    // Only the crossing chunk's thread walks its slice
+    if (s_idx[0] >= 0 && tid == uint(s_idx[0])) {
+        float cum = s_val[0];
+        for (uint v = beg; v < end; v++) {
+            cum += exp(logits_buf.data[base + v] * pc.inv_temp - max_l);
+            if (cum >= r) {
+                s_tok = int(v);
+                break;
+            }
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        sampled_buf.data[row] = s_tok;
+    }
+}

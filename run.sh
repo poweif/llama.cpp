@@ -27,6 +27,8 @@ if (( use_diffusion )); then
     device_args=()
     if (( use_vulkan )); then
         device_args=(--device Vulkan0)
+    else
+        device_args=(--device ROCm0)
     fi
     exec "$SCRIPT_DIR/build/bin/llama-diffusion-server" \
         -m /home/poweif/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q8_0.gguf \
