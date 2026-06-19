@@ -6,12 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 use_vulkan=0
 use_qwen3=0
 use_gemma_mtp=0
+use_diffusion=0
 passthrough=()
 for arg in "$@"; do
     case "$arg" in
         --vulkan)     use_vulkan=1 ;;
         --qwen3)      use_qwen3=1 ;;
         --gemma-mtp)  use_gemma_mtp=1 ;;
+        --diffusion)  use_diffusion=1 ;;
         *)            passthrough+=("$arg") ;;
     esac
 done
@@ -19,6 +21,19 @@ set -- "${passthrough[@]+"${passthrough[@]}"}"
 
 if (( use_vulkan )); then
     export HIP_VISIBLE_DEVICES=""
+fi
+
+if (( use_diffusion )); then
+    device_args=()
+    if (( use_vulkan )); then
+        device_args=(--device Vulkan0)
+    fi
+    exec "$SCRIPT_DIR/build/bin/llama-diffusion-server" \
+        -m /home/poweif/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q8_0.gguf \
+        "${device_args[@]}" \
+        -ngl 99 \
+        --port 8190 \
+        "$@"
 fi
 #	-m /home/poweif/models/Qwen_Qwen3-Coder-Next-Q6_K_L-00001-of-00002.gguf
 #	-m /home/poweif/models/Qwen_Qwen3-Coder-Next-Q5_K_M-00001-of-00002.gguf

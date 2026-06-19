@@ -18,4 +18,4 @@ CXX=/usr/bin/clang++-17 CC=/usr/bin/clang-17 cmake -B "$SCRIPT_DIR/build" \
     -DLLAMA_BUILD_SERVER=ON \
     "$SCRIPT_DIR"
 
-cmake --build "$SCRIPT_DIR/build" --target llama-server llama-cli -j"$(nproc)"
+cmake --build "$SCRIPT_DIR/build" --target llama-server llama-cli llama-diffusion-server -j"$(nproc)"
