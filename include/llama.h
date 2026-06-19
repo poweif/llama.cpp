@@ -339,6 +339,7 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -387,6 +388,10 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // a source/target/parent context
+        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        struct llama_context * ctx_other;
     };
 
     struct llama_model_tensor_override {
@@ -552,6 +557,55 @@ extern "C" {
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
+
+    // DiffusionGemma self-conditioning: set per-request state for the next llama_decode. sc_logits is
+    // [n_vocab * canvas_length] host floats (previous step's raw logits; NULL when !enabled). use_sc is a
+    // {0,1} gate; temp_inv = 1/temperature. !enabled = byte-identical to zero-SC; no-op for other models.
+    LLAMA_API void llama_diffusion_set_sc(
+            struct llama_model * model,
+                   const float * sc_logits,
+                         float   use_sc,
+                         float   temp_inv,
+                          bool   enabled);
+
+    // DiffusionGemma device-resident self-conditioning: when enabled, the SC input is read from a persistent
+    // device buffer (written in-graph from the previous step's logits) instead of a per-step host upload. The
+    // SC math is unchanged/bit-identical; single-device only. No-op for other models. Caller restores false.
+    LLAMA_API void llama_diffusion_set_device_sc(
+            struct llama_model * model,
+                          bool   enabled);
+
+    // DiffusionGemma Stage-1 device sampling: argmax/entropy/one multinomial draw per canvas position read
+    // directly from the device SC buffer (sc_dev), removing the per-step full-canvas logits download + host
+    // reductions. u is [n_tokens] host pre-drawn uniforms (the host RNG stream, for reproducibility); argmax,
+    // entropy, sampled are [n_tokens] host outputs. Caller MUST llama_synchronize(ctx) first. Requires a
+    // single CUDA device + device-resident SC on. Returns false (caller falls back to the host path) when
+    // unavailable. argmax matches the host bit-for-bit; entropy/sampled differ only by FP reduction order.
+    LLAMA_API bool llama_diffusion_device_sample(
+            const struct llama_model * model,
+                       const float   * u,
+                               int   * argmax,
+                             float   * entropy,
+                               int   * sampled,
+                               int     n_tokens,
+                             float     inv_temp);
+
+    // DiffusionGemma prompt KV caching: select the forward phase for the next llama_decode (P = block
+    // prompt length, used to size the store; no-op otherwise).  0 = UNIFIED (no-cache [prompt|canvas]),
+    // 1 = PREFILL (forward the prompt chunk starting at off, writing the K,V store causally),  2 = DECODE
+    // (forward the canvas, read the cached prompt K,V).  off is the chunk's global start (PREFILL only;
+    // pass 0 for an unchunked single-shot prefill).
+    LLAMA_API void llama_diffusion_set_phase(
+            struct llama_model * model,
+                           int   phase,
+                       int32_t   P,
+                       int32_t   off);
+
+    // DiffusionGemma prompt-KV store bytes per prompt token (0 for other models). Pass use_f16 = whether
+    // flash attention is enabled (the store is F16 under FA, F32 otherwise). Sizes context against the store.
+    LLAMA_API size_t llama_diffusion_pkv_bytes_per_token(
+            const struct llama_model * model,
+                              bool      use_f16);
 
     LLAMA_API int32_t llama_model_n_ctx_train(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
@@ -874,7 +928,8 @@ extern "C" {
 // work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
-// keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load)
+// Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
+// Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
     typedef uint32_t llama_state_seq_flags;
@@ -974,7 +1029,11 @@ extern "C" {
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
-    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+    //
+    // note: using this can cause extra graph reallocations because it changes the graph topology with MoE models,
+    //       so it is generally not recommended to use in practice. will be removed in the future
+    DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
+            "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

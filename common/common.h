@@ -277,6 +277,7 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    bool                     reasoning_control = false;        // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
 
@@ -379,7 +380,10 @@ struct common_params_vocoder {
 
 struct common_params_diffusion {
     int32_t steps         = 128;
+    int32_t blocks        = 1;        // max block-autoregressive denoising blocks (block-diffusion models)
     bool    visual_mode   = false;
+    bool    visual_progress = false;  // show the step progress bar in visual mode (default: hidden)
+    int32_t visual_interval = 1;      // redraw the visual canvas every Nth step (all steps still computed)
 
     float   eps           = 0;        // epsilon for timesteps
     int32_t block_length  = 0;        // block length for generation
@@ -389,6 +393,18 @@ struct common_params_diffusion {
 
     float   cfg_scale     = 0;        // classifier-free guidance scale
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
+
+    // entropy-bound decoder (DiffusionGemma canvas models); params default to GGUF metadata, then reference
+    int32_t eb_mode          = 0;     // 0=auto (on for canvas models), 1=force on, 2=off
+    float   eb_t_min         = -1.0f; // <0 / <=0 -> not overridden on the command line
+    float   eb_t_max         = -1.0f;
+    float   eb_entropy_bound = -1.0f;
+    int32_t eb_stability     = -1;
+    float   eb_confidence    = -1.0f;
+    int32_t eb_max_steps     = -1;
+    int32_t eb_kv_cache      = 0;     // prefix KV cache: 0=auto (on for single-GPU canvas), 1=on, 2=off
+    int32_t eb_gpu_sampling  = 0;     // device-resident SC: 0=auto (on for single-GPU canvas), 1=on, 2=off
+    int32_t eb_gpu_sample_reduce = 0; // Stage-1 device argmax/entropy/sample reduction: 0=auto (on for single-GPU), 1=on, 2=off
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)
@@ -431,6 +447,7 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
+    int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -479,7 +496,7 @@ struct common_params {
 
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT
     std::set<std::string> model_tags;      // model tags (informational, not used for routing)              // NOLINT
-    std::string hf_token             = ""; // HF token                                                      // NOLINT
+    std::string hf_token             = ""; // HF token (aka bearer token)                                   // NOLINT
     std::string prompt               = "";                                                                  // NOLINT
     std::string system_prompt        = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
@@ -487,6 +504,7 @@ struct common_params {
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
+    std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
@@ -507,6 +525,7 @@ struct common_params {
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
+    bool    skip_download              = false; // skip model file downloading
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
@@ -568,7 +587,7 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
-    std::vector<std::string> image; // path to image file(s)
+    std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
 
@@ -587,14 +606,15 @@ struct common_params {
     // server params
     int32_t port                = 8080;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
-    int32_t timeout_read        = 600;           // http read timeout in seconds
+    int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
+    int32_t sse_ping_interval   = 30;            // SSE ping interval in seconds
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
+    int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -617,11 +637,7 @@ struct common_params {
     std::map<std::string, std::string> default_template_kwargs;
 
     // UI configs
-#ifdef LLAMA_UI_DEFAULT_ENABLED
-    bool ui = LLAMA_UI_DEFAULT_ENABLED != 0;
-#else
-    bool ui = true; // default to enabled when not set
-#endif
+    bool ui = true;
 
     // Deprecated: use ui, ui_mcp_proxy, ui_config_json instead
     bool webui = ui;
@@ -735,6 +751,7 @@ std::string string_format(const char * fmt, ...);
 
 std::string string_strip(const std::string & str);
 std::string string_get_sortable_timestamp();
+std::string string_lcs(std::string_view a, std::string_view b);
 
 std::string string_join(const std::vector<std::string> & values, const std::string & separator);
 std::vector<std::string> string_split(const std::string & str, const std::string & delimiter);
@@ -929,7 +946,8 @@ void common_batch_add(
 // tokens from memory, so this approach works across all model architectures.
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & embd,
+    const std::vector<llama_token> & all_tokens,
+                               int   n_new,
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
