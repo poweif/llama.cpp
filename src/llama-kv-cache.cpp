@@ -382,7 +382,7 @@ llama_kv_cache::llama_kv_cache(
             // Use the first KV-cache layer's buffer type (same device as KV data).
             ggml_backend_buffer_type_t rot_buft = ggml_backend_cpu_buffer_type();
             if (offload) {
-                for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                for (uint32_t il = 0; il < hparams.n_layer(); il++) {
                     if (hparams.has_kv(il) && (!filter || filter(il))) {
                         rot_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
                         break;

@@ -85,7 +85,7 @@ std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_grap
 }
 
 llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_graph_params & params) :
-        llm_graph_context(params) {
+        llm_graph_context(params), model(model) {
     const int64_t n_embd_backbone = hparams.n_embd_inp();
 
     ggml_tensor * inp_tokens;
@@ -196,6 +196,7 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
 
     ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
     cb(h_next, "h_nextn", -1);
+    res->t_embd   = h_next; // satisfies build_pooling when cparams.embeddings=true; also feeds llama_get_embeddings_ith
     res->t_h_nextn = h_next;
 
     ggml_build_forward_expand(gf, logits);

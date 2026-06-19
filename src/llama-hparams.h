@@ -190,16 +190,13 @@ struct llama_hparams {
     // for Classifiers
     uint32_t n_cls_out = 1;
 
-    // input embedding dimension (0 = use n_embd)
-    uint32_t n_embd_inp_impl = 0;
-
-    // output embedding dimension (0 = use n_embd)
-    uint32_t n_embd_out_impl = 0;
-
     // input embedding dimension override for batch.embd stride (0 = use n_embd)
     // set for models where batch.embd rows are wider than the model's internal n_embd
     // (e.g. gemma4-assistant uses backbone dim = target n_embd for its embd input)
     uint32_t n_embd_inp_impl = 0;
+
+    // output embedding dimension (0 = use n_embd)
+    uint32_t n_embd_out_impl = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

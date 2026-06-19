@@ -524,12 +524,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // Both regular MTP and gemma4-assistant need the target's pre-norm embeddings.
-        llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         if (is_gemma4_asst) {
             // Gemma4 assistant: expose backbone embd via llama_get_embeddings_ith(ctx_dft, i)
             llama_set_embeddings(ctx_dft, true);
         } else {
-            llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+            llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         }
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
@@ -612,7 +612,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 verify_h_rows[seq_id] = n_rows;
                 verify_h[seq_id].resize((size_t) n_rows * n_embd_hidden);
                 for (int32_t i = 0; i < n_rows; ++i) {
-                    const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                     std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd_hidden, h, row_bytes_h);
                 }
                 std::memcpy(pending_h[seq_id].data(),
@@ -656,7 +656,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -787,7 +787,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
 
                     i_batch_map[seq_id] = (int32_t) batch.n_tokens;
-                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+                    // Shared KV (apply_ubatch is a no-op) — cell tracker never advances,
+                    // so all draft positions must stay at dp.n_past to keep the gap-1 check happy.
+                    common_batch_add(batch, id, dp.n_past, { seq_id }, true);
                     // Use the backbone embedding from the previous step as hidden state
                     std::memcpy(batch.embd + (size_t) i_batch_map[seq_id] * n_embd_hidden,
                             draft_h[seq_id].data(), row_bytes_h);
@@ -955,7 +957,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return false;
     }
 
-    bool need_embd_pre_norm() const override {
+    bool need_embd_nextn() const override {
         return true; // both regular MTP and gemma4-assistant need target pre-norm embeddings
     }
 };

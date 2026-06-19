@@ -490,8 +490,9 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
 
     // Cached path: PREFILL the prompt once (writing the prefix K/V store), then each step DECODE only the
     // canvas, reading the cached prefix - instead of re-decoding [prompt|canvas] every step. In both paths
-    // canvas logits then start at row 0 (cached) instead of row n_input (unified).
-    const int32_t logit_off = params.kv_cache ? 0 : n_input;
+    // canvas logits start at row 0 in the output buffer: kv_cache=on because only canvas tokens are in the
+    // batch; kv_cache=off because prefix tokens are unflagged (logits[i]=0), so outputs are canvas-only.
+    const int32_t logit_off = 0;
     if (params.kv_cache) {
         llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
         // Chunked causal PREFILL: feed the prompt in ubatch-sized chunks, each writing its K/V to the store and
@@ -549,7 +550,9 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                 batch.pos[i]       = i;
                 batch.n_seq_id[i]  = 1;
                 batch.seq_id[i][0] = 0;
-                batch.logits[i]    = 1;
+                // Only canvas tokens need logits; prefix logits are unused. Flagging only canvas keeps
+                // n_outputs == canvas_length, fitting within the capped n_outputs_max in the context params.
+                batch.logits[i]    = (i >= n_input) ? 1 : 0;
             }
         }
 

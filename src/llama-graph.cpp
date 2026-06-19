@@ -424,6 +424,7 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
 
 void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens   = ubatch->n_tokens;
+    const int64_t n_kv       = n_tokens; // no-cache: mask is n_tokens × n_tokens
     const int64_t n_seqs_unq = ubatch->equal_seqs() ? ubatch->n_seqs_unq : 1;
     const int64_t n_tps      = n_tokens / n_seqs_unq;
 
