@@ -323,6 +323,7 @@ int main(int argc, char ** argv) {
     mparams.devices              = params.devices.data();
     mparams.use_mmap             = params.use_mmap;
     mparams.use_mlock            = params.use_mlock;
+    mparams.kv_overrides         = params.kv_overrides.empty() ? nullptr : params.kv_overrides.data();
     if (!params.tensor_buft_overrides.empty()) {
         GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr);
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
@@ -341,7 +342,13 @@ int main(int argc, char ** argv) {
 
     char canvas_str[32];
     int64_t canvas_length = 0;
-    if (llama_model_meta_val_str(model, "diffusion.canvas_length", canvas_str, sizeof(canvas_str)) >= 0) {
+    for (const auto & ov : params.kv_overrides) {
+        if (strcmp(ov.key, "diffusion.canvas_length") == 0 && ov.tag == LLAMA_KV_OVERRIDE_TYPE_INT) {
+            canvas_length = ov.val_i64;
+            break;
+        }
+    }
+    if (canvas_length <= 0 && llama_model_meta_val_str(model, "diffusion.canvas_length", canvas_str, sizeof(canvas_str)) >= 0) {
         canvas_length = strtol(canvas_str, nullptr, 10);
     }
     if (canvas_length <= 0) {

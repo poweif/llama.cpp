@@ -35,6 +35,7 @@ if (( use_diffusion )); then
         "${device_args[@]}" \
         -ngl 99 \
         --port 8190 \
+        --override-kv diffusion.canvas_length=int:64 \
         "$@"
 fi
 #	-m /home/poweif/models/Qwen_Qwen3-Coder-Next-Q6_K_L-00001-of-00002.gguf
