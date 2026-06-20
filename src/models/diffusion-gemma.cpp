@@ -63,14 +63,16 @@ public:
             }
         };
 
-        GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer));
-        if (self_kq_mask->type == GGML_TYPE_F16) {
-            fill((ggml_fp16_t *) self_kq_mask->data, false);
-        } else {
-            fill((float *) self_kq_mask->data, false);
+        if (self_kq_mask && self_kq_mask->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+            if (self_kq_mask->type == GGML_TYPE_F16) {
+                fill((ggml_fp16_t *) self_kq_mask->data, false);
+            } else {
+                fill((float *) self_kq_mask->data, false);
+            }
         }
 
-        if (self_kq_mask_swa) {
+        if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
             if (self_kq_mask_swa->type == GGML_TYPE_F16) {
                 fill((ggml_fp16_t *) self_kq_mask_swa->data, true);
@@ -141,13 +143,15 @@ public:
             }
         };
 
-        GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer));
-        if (self_kq_mask->type == GGML_TYPE_F16) {
-            fill((ggml_fp16_t *) self_kq_mask->data, false);
-        } else {
-            fill((float *) self_kq_mask->data, false);
+        if (self_kq_mask && self_kq_mask->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+            if (self_kq_mask->type == GGML_TYPE_F16) {
+                fill((ggml_fp16_t *) self_kq_mask->data, false);
+            } else {
+                fill((float *) self_kq_mask->data, false);
+            }
         }
-        if (self_kq_mask_swa) {
+        if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
             if (self_kq_mask_swa->type == GGML_TYPE_F16) {
                 fill((ggml_fp16_t *) self_kq_mask_swa->data, true);
@@ -189,13 +193,15 @@ public:
             }
         };
 
-        GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer));
-        if (self_kq_mask->type == GGML_TYPE_F16) {
-            fill((ggml_fp16_t *) self_kq_mask->data, false);
-        } else {
-            fill((float *) self_kq_mask->data, false);
+        if (self_kq_mask && self_kq_mask->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+            if (self_kq_mask->type == GGML_TYPE_F16) {
+                fill((ggml_fp16_t *) self_kq_mask->data, false);
+            } else {
+                fill((float *) self_kq_mask->data, false);
+            }
         }
-        if (self_kq_mask_swa) {
+        if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
             if (self_kq_mask_swa->type == GGML_TYPE_F16) {
                 fill((ggml_fp16_t *) self_kq_mask_swa->data, true);
@@ -365,6 +371,32 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
     // PREFILL processes one prompt chunk of n_tokens queries starting at global position prefill_off; its
     // keys span [0, prefill_off + n_tokens) (prior chunks live in the store, this chunk is fresh).
     const int64_t prefill_off = is_prefill ? dmodel.pkv_prefill_off : 0;
+
+    struct llm_graph_input_dg_phase : public llm_graph_input_i {
+        llama_model_diffusion_gemma::pkv_phase_t phase;
+        int64_t P;
+        int64_t prefill_off;
+        bool sc_enabled;
+        bool sc_device_resident;
+        float sc_use;
+        float sc_temp_inv;
+        const llama_model_diffusion_gemma & dmodel;
+
+        llm_graph_input_dg_phase(llama_model_diffusion_gemma::pkv_phase_t phase, int64_t P, int64_t prefill_off, const llama_model_diffusion_gemma & dmodel) :
+            phase(phase), P(P), prefill_off(prefill_off),
+            sc_enabled(dmodel.sc_enabled), sc_device_resident(dmodel.sc_device_resident),
+            sc_use(dmodel.sc_use), sc_temp_inv(dmodel.sc_temp_inv),
+            dmodel(dmodel) {}
+
+        void set_input(const llama_ubatch * /* ubatch */) override {}
+
+        bool can_reuse(const llm_graph_params & /* params */) override {
+            return phase == dmodel.pkv_phase && P == dmodel.pkv_P && prefill_off == dmodel.pkv_prefill_off &&
+                   sc_enabled == dmodel.sc_enabled && sc_device_resident == dmodel.sc_device_resident &&
+                   sc_use == dmodel.sc_use && sc_temp_inv == dmodel.sc_temp_inv;
+        }
+    };
+    res->add_input(std::make_unique<llm_graph_input_dg_phase>(phase, dmodel.pkv_P, dmodel.pkv_prefill_off, dmodel));
 
     // Allocate the store on the first PREFILL chunk, sized to the whole prompt (pkv_P). Type follows FA so it
     // is precision-neutral: under FA, build_attn casts K,V to F16 regardless. DECODE only reads a prior store.

@@ -606,7 +606,11 @@ static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct gg
 }
 
 static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
-    return ggml_gallocr_hash_get(galloc, t)->allocated;
+    if (ggml_hash_contains(&galloc->hash_set, t)) {
+        size_t i = ggml_hash_find(&galloc->hash_set, t);
+        return galloc->hash_values[i].allocated;
+    }
+    return false;
 }
 
 static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -1041,13 +1045,25 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     for (int i = 0; i < graph->n_nodes; i++) {
+        if (!ggml_hash_contains(&galloc->hash_set, graph->nodes[i])) {
+            GGML_LOG_ERROR("%s: graph->nodes[%d] (%s) is new (not in hash_set)\n", __func__, i, graph->nodes[i]->name);
+            return true;
+        }
+    }
+
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (!ggml_hash_contains(&galloc->hash_set, graph->leafs[i])) {
+            GGML_LOG_ERROR("%s: graph->leafs[%d] (%s) is new (not in hash_set)\n", __func__, i, graph->leafs[i]->name);
+            return true;
+        }
+    }
+
+    for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
-#endif
+            GGML_LOG_ERROR("%s: node %s needs realloc (size_max)\n", __func__, node->name);
             return true;
         }
 
@@ -1057,9 +1073,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
-#endif
+                GGML_LOG_ERROR("%s: src %d (%s) of node %s needs realloc\n", __func__, j, src->name, node->name);
                 return true;
             }
         }
