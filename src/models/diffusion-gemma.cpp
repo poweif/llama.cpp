@@ -1,5 +1,6 @@
 #include "models.h"
 #include "gemma4-common.h"
+#include "llama-context.h"
 
 #include <algorithm>
 #include <cstring>
@@ -874,6 +875,16 @@ size_t llama_diffusion_pkv_bytes_per_token(const struct llama_model * model, boo
         bytes += (size_t) dm->hparams.n_embd_head_k(il) * dm->hparams.n_head_kv(il) * 2 * elt; // K + V
     }
     return bytes;
+}
+
+// Public API: pre-allocate the prompt-KV store with max_tokens capacity so that the first PREFILL of
+// any request never triggers a free+realloc. Must be called after the llama_context is fully initialized
+// (flash_attn resolution is complete). No-op for non-DiffusionGemma models or when kv_cache is off.
+void llama_diffusion_preallocate_pkv_store(struct llama_context * ctx, int32_t max_tokens) {
+    const auto * dm = dynamic_cast<const llama_model_diffusion_gemma *>(&ctx->get_model());
+    if (!dm) { return; }
+    const ggml_type type = ctx->get_cparams().flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    dg_ensure_pkv_store(*dm, max_tokens, type);
 }
 
 // Public API: select the prompt-KV-caching phase for the next llama_decode (no-op otherwise). UNIFIED =

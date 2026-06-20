@@ -607,6 +607,13 @@ extern "C" {
             const struct llama_model * model,
                               bool      use_f16);
 
+    // Pre-allocate the DiffusionGemma prompt-KV store to max_tokens capacity. Prevents reallocation during
+    // inference when the first request's prompt exceeds the lazily-allocated capacity. Call after context
+    // initialization (flash_attn resolution is complete). No-op for non-DiffusionGemma or kv_cache=off.
+    LLAMA_API void llama_diffusion_preallocate_pkv_store(
+            struct llama_context * ctx,
+                        int32_t    max_tokens);
+
     LLAMA_API int32_t llama_model_n_ctx_train(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp (const struct llama_model * model);

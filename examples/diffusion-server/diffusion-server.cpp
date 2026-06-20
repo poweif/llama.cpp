@@ -5,6 +5,15 @@
 //
 // Streaming (stream:true): each committed block is flushed as an SSE delta chunk.
 // Non-streaming: the full assembled response is returned as a single JSON object.
+//
+// Tool calls: fully supported. Tools are passed to the chat template; the generated
+// response is parsed with common_chat_parse to extract any tool_calls and format them
+// in the OpenAI-compatible response. When tools are present in a streaming request,
+// text is buffered during generation and emitted after parsing to avoid leaking raw
+// tool-call syntax in the content stream.
+//
+// Image input: not supported — DiffusionGemma has no vision encoder (mmproj). Any
+// request containing image_url content parts is rejected with HTTP 400.
 
 #include "arg.h"
 #include "chat.h"
@@ -63,8 +72,9 @@ struct chunk_queue {
 };
 
 // ---------------------------------------------------------------------------
-// Format one SSE data line for a chat-completion chunk delta.
+// SSE helpers
 // ---------------------------------------------------------------------------
+
 static std::string make_sse_chunk(const std::string & id, const std::string & model_name,
                                   const std::string & delta, bool is_first) {
     json choice = {
@@ -72,6 +82,44 @@ static std::string make_sse_chunk(const std::string & id, const std::string & mo
         {"delta",         is_first
                               ? json{{"role", "assistant"}, {"content", delta}}
                               : json{{"content", delta}}},
+        {"finish_reason", nullptr},
+    };
+    json obj = {
+        {"id",      id},
+        {"object",  "chat.completion.chunk"},
+        {"model",   model_name},
+        {"choices", json::array({choice})},
+    };
+    return "data: " + obj.dump() + "\n\n";
+}
+
+static std::string make_sse_finish_chunk(const std::string & id, const std::string & model_name,
+                                         const std::string & finish_reason) {
+    json choice = {
+        {"index",         0},
+        {"delta",         json::object()},
+        {"finish_reason", finish_reason},
+    };
+    json obj = {
+        {"id",      id},
+        {"object",  "chat.completion.chunk"},
+        {"model",   model_name},
+        {"choices", json::array({choice})},
+    };
+    return "data: " + obj.dump() + "\n\n";
+}
+
+static std::string make_sse_tool_call_chunk(const std::string & id, const std::string & model_name,
+                                            const common_chat_tool_call & tc, size_t idx) {
+    json tc_json = {
+        {"index",    (int) idx},
+        {"id",       tc.id},
+        {"type",     "function"},
+        {"function", {{"name", tc.name}, {"arguments", tc.arguments}}},
+    };
+    json choice = {
+        {"index",         0},
+        {"delta",         {{"tool_calls", json::array({tc_json})}}},
         {"finish_reason", nullptr},
     };
     json obj = {
@@ -123,26 +171,27 @@ struct server_state {
 };
 
 // ---------------------------------------------------------------------------
-// Run one inference turn and push completed blocks through `out`.
-// Called from a detached thread for streaming, or inline for non-streaming.
-// Returns the full assembled response text.
+// One generation request: pre-formatted prompt + sampling knobs.
+// The caller applies the chat template (with tools if any) before creating
+// this struct so that run_generation can stay format-agnostic.
 // ---------------------------------------------------------------------------
 struct gen_request {
-    std::vector<common_chat_msg> messages;
-    int                          seed     = 0;
-    int                          n_blocks = 1;
+    std::string prompt;
+    int         seed     = 0;
+    int         n_blocks = 1;
 };
 
+// ---------------------------------------------------------------------------
+// Run one inference turn and push committed blocks as SSE deltas through
+// `stream_q` (null for non-streaming / buffered-tool-call mode).
+// Returns the full assembled response text.
+// Does NOT push [DONE] or call stream_q->finish() — the caller is responsible.
+// ---------------------------------------------------------------------------
 static std::string run_generation(server_state & st,
                                   const gen_request & req,
-                                  chunk_queue * stream_q,   // null for non-streaming
+                                  chunk_queue * stream_q,
                                   const std::string & req_id) {
-    // Apply chat template and tokenize.
-    common_chat_templates_inputs inputs;
-    inputs.messages              = req.messages;
-    inputs.add_generation_prompt = true;
-    const std::string prompt     = common_chat_templates_apply(st.chat_templates.get(), inputs).prompt;
-    std::vector<llama_token> prefix = common_tokenize(st.vocab, prompt, true, true);
+    std::vector<llama_token> prefix = common_tokenize(st.vocab, req.prompt, true, true);
 
     std::vector<llama_token> output_tokens((size_t) st.maxtok);
     std::vector<llama_token> answer;
@@ -174,7 +223,6 @@ static std::string run_generation(server_state & st,
         const std::string block_text = common_detokenize(st.vocab, answer, true);
 
         if (stream_q) {
-            // delta = new text appended by this block
             const std::string delta = block_text.substr(full_text.size());
             stream_q->push(make_sse_chunk(req_id, st.model_name, delta, first_block));
         }
@@ -185,10 +233,6 @@ static std::string run_generation(server_state & st,
         prefix.insert(prefix.end(), canvas, canvas + cut);
     }
 
-    if (stream_q) {
-        stream_q->push(make_sse_done());
-        stream_q->finish();
-    }
     return full_text;
 }
 
@@ -211,9 +255,61 @@ static void handle_models(const httplib::Request &, httplib::Response & res,
     res.set_content(body.dump(), "application/json");
 }
 
+// Scan a messages array for image_url / image content parts.
+// Returns a non-empty error string if any are found (with minimal format validation),
+// or empty string if clean.
+static std::string check_no_image_parts(const json & messages) {
+    if (!messages.is_array()) { return {}; }
+    for (const auto & msg : messages) {
+        if (!msg.is_object() || !msg.contains("content")) { continue; }
+        const auto & content = msg.at("content");
+        if (!content.is_array()) { continue; }
+        for (const auto & part : content) {
+            if (!part.is_object() || !part.contains("type")) { continue; }
+            const auto & type = part.at("type");
+            if (type == "image_url" || type == "image") {
+                // Validate image_url structure before rejecting so callers get a useful error.
+                if (type == "image_url") {
+                    if (!part.contains("image_url") || !part.at("image_url").is_object()) {
+                        return "Malformed image_url content part: missing or non-object 'image_url' field";
+                    }
+                    if (!part.at("image_url").contains("url")) {
+                        return "Malformed image_url content part: missing 'url' field";
+                    }
+                }
+                return "Image input is not supported: this model has no vision encoder. "
+                       "Remove image content parts from the request.";
+            }
+        }
+    }
+    return {};
+}
+
+// Parse the generated text to extract tool calls and clean content.
+// Loads the serialised PEG arena from cp.parser so the model-specific format
+// (Gemma 4 thinking channel, tool call delimiters, generation-prompt prefix) is
+// handled correctly.  Falls back to treating full_text as plain content on failure.
+static common_chat_msg parse_response(const std::string & full_text, const common_chat_params & cp) {
+    common_chat_msg parsed;
+    try {
+        common_chat_parser_params pp(cp);
+        if (!cp.parser.empty()) {
+            pp.parser.load(cp.parser);
+        }
+        parsed = common_chat_parse(full_text, /*is_partial=*/false, pp);
+    } catch (...) {
+        parsed.content = full_text;
+    }
+    // Assign stable IDs to any tool calls that didn't emit one.
+    std::vector<std::string> ids;
+    parsed.set_tool_call_ids(ids, [&] {
+        return std::string("call_") + std::to_string(ggml_time_us());
+    });
+    return parsed;
+}
+
 static void handle_chat_completions(const httplib::Request & req, httplib::Response & res,
                                     server_state & st) {
-    // Reject concurrent requests: diffusion context is not thread-safe.
     bool expected = false;
     if (!st.inferring.compare_exchange_strong(expected, true)) {
         res.status = 503;
@@ -221,24 +317,56 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
                         "application/json");
         return;
     }
+    // busy_guard resets st.inferring on scope exit. For streaming requests we
+    // transfer ownership into the generation thread so the flag stays true until
+    // inference actually finishes (not just until the HTTP handler returns).
+    bool thread_owns_guard = false;
+    struct guard { std::atomic<bool> & flag; bool & skip; ~guard() { if (!skip) flag.store(false); } }
+        busy_guard{st.inferring, thread_owns_guard};
 
-    // Ensure the busy flag is cleared when we exit, regardless of path.
-    struct guard {
-        std::atomic<bool> & flag;
-        ~guard() { flag.store(false); }
-    } busy_guard{st.inferring};
+    gen_request      gr;
+    bool             stream      = false;
+    bool             has_tools   = false;
+    std::string      req_id;
+    common_chat_params chat_params;
 
-    // Parse request body.
-    gen_request gr;
-    bool        stream = false;
-    std::string req_id;
     try {
         const json body = json::parse(req.body);
-        stream    = body.value("stream", false);
-        gr.seed   = body.value("seed",     0);
+        stream      = body.value("stream", false);
+        gr.seed     = body.value("seed",     0);
         gr.n_blocks = body.value("n_blocks", 1);
-        req_id    = body.value("id", std::string("chatcmpl-") + std::to_string(ggml_time_us()));
-        gr.messages = common_chat_msgs_parse_oaicompat(body.at("messages"));
+        req_id      = body.value("id", std::string("chatcmpl-") + std::to_string(ggml_time_us()));
+
+        const json & msg_arr = body.at("messages");
+
+        // Reject image content — no vision encoder is available.
+        const std::string img_err = check_no_image_parts(msg_arr);
+        if (!img_err.empty()) {
+            res.status = 400;
+            json err = {{"error", {{"message", img_err}, {"type", "invalid_request_error"}}}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        auto messages = common_chat_msgs_parse_oaicompat(msg_arr);
+
+        // Build template inputs, injecting tools if provided.
+        common_chat_templates_inputs tmpl_inputs;
+        tmpl_inputs.messages              = std::move(messages);
+        tmpl_inputs.add_generation_prompt = true;
+
+        if (body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty()) {
+            tmpl_inputs.tools = common_chat_tools_parse_oaicompat(body.at("tools"));
+            has_tools = true;
+        }
+        if (body.contains("tool_choice") && body.at("tool_choice").is_string()) {
+            tmpl_inputs.tool_choice =
+                common_chat_tool_choice_parse_oaicompat(body.at("tool_choice"));
+        }
+
+        chat_params = common_chat_templates_apply(st.chat_templates.get(), tmpl_inputs);
+        gr.prompt   = chat_params.prompt;
+
     } catch (const std::exception & e) {
         res.status = 400;
         json err = {{"error", {{"message", e.what()}, {"type", "invalid_request_error"}}}};
@@ -247,44 +375,104 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
     }
 
     if (stream) {
-        // Streaming: run inference in a background thread, stream blocks as SSE.
         auto q = std::make_shared<chunk_queue>();
 
-        // The content provider is called repeatedly by httplib's send thread; it blocks on q->pop().
-        // We capture st by reference — safe because st outlives all requests.
         res.set_chunked_content_provider(
             "text/event-stream",
             [q](size_t, httplib::DataSink & sink) -> bool {
                 std::string chunk;
-                if (q->pop(chunk)) {
-                    return sink.write(chunk.data(), chunk.size());
-                }
+                if (q->pop(chunk)) { return sink.write(chunk.data(), chunk.size()); }
                 sink.done();
                 return false;
             }
         );
 
-        // Launch inference; the lambda owns q via shared_ptr, st is global.
-        std::thread([&st, gr, q, req_id]() mutable {
-            run_generation(st, gr, q.get(), req_id);
+        // Transfer the busy flag to the generation thread: the flag must stay true
+        // until inference finishes, not just until the HTTP handler returns.
+        thread_owns_guard = true;
+        // When tools are present we suppress per-block streaming so raw tool-call syntax
+        // never reaches the client as content; we emit clean deltas after parsing.
+        std::thread([&st, gr, q, req_id, chat_params, has_tools]() mutable {
+            // Reset st.inferring when this thread exits (transferred from handler guard).
+            struct thread_guard { std::atomic<bool> & f; ~thread_guard() { f.store(false); } }
+                tg{st.inferring};
+            try {
+                chunk_queue * gen_q  = has_tools ? nullptr : q.get();
+                std::string full_text = run_generation(st, gr, gen_q, req_id);
+
+                if (has_tools) {
+                    const auto parsed = parse_response(full_text, chat_params);
+
+                    // Emit content delta (clean, without embedded tool-call syntax).
+                    if (!parsed.content.empty()) {
+                        q->push(make_sse_chunk(req_id, st.model_name, parsed.content, true));
+                    }
+
+                    // Emit one chunk per tool call.
+                    for (size_t i = 0; i < parsed.tool_calls.size(); i++) {
+                        q->push(make_sse_tool_call_chunk(req_id, st.model_name,
+                                                         parsed.tool_calls[i], i));
+                    }
+
+                    const std::string reason =
+                        parsed.tool_calls.empty() ? "stop" : "tool_calls";
+                    q->push(make_sse_finish_chunk(req_id, st.model_name, reason));
+                } else {
+                    q->push(make_sse_finish_chunk(req_id, st.model_name, "stop"));
+                }
+
+                q->push(make_sse_done());
+            } catch (...) {
+                q->push("data: {\"error\":{\"message\":\"Internal generation error\","
+                        "\"type\":\"internal_error\"}}\n\n");
+                q->push(make_sse_done());
+            }
+            q->finish();
         }).detach();
 
     } else {
-        // Non-streaming: run inference synchronously, return full JSON.
-        const std::string text = run_generation(st, gr, nullptr, req_id);
+        const std::string full_text = run_generation(st, gr, nullptr, req_id);
+
+        // Only invoke the PEG parser when tools are present. Without tools,
+        // return full_text directly — the parser would otherwise prepend the
+        // generation_prompt into the content field.
+        json        msg_json      = {{"role", "assistant"}};
+        std::string finish_reason = "stop";
+
+        if (has_tools) {
+            const auto parsed = parse_response(full_text, chat_params);
+            const std::string & text = parsed.content.empty() ? full_text : parsed.content;
+            if (parsed.tool_calls.empty()) {
+                msg_json["content"] = text;
+            } else {
+                finish_reason          = "tool_calls";
+                msg_json["content"]    = text.empty() ? json(nullptr) : json(text);
+                json tc_arr = json::array();
+                for (const auto & tc : parsed.tool_calls) {
+                    tc_arr.push_back({
+                        {"id",       tc.id},
+                        {"type",     "function"},
+                        {"function", {{"name", tc.name}, {"arguments", tc.arguments}}},
+                    });
+                }
+                msg_json["tool_calls"] = tc_arr;
+            }
+        } else {
+            msg_json["content"] = full_text;
+        }
 
         json choice = {
             {"index",         0},
-            {"message",       {{"role", "assistant"}, {"content", text}}},
-            {"finish_reason", "stop"},
+            {"message",       msg_json},
+            {"finish_reason", finish_reason},
         };
-        json body = {
+        json resp_body = {
             {"id",      req_id},
             {"object",  "chat.completion"},
             {"model",   st.model_name},
             {"choices", json::array({choice})},
         };
-        res.set_content(body.dump(), "application/json");
+        res.set_content(resp_body.dump(), "application/json");
     }
 }
 
@@ -523,6 +711,14 @@ int main(int argc, char ** argv) {
     LOG_INF("diffusion-server: model=%s canvas=%d maxtok=%d (%s) ngl=%d gpu_sampling=%s kv_cache=%s\n",
             model_name.c_str(), (int) canvas_length, maxtok, reason,
             params.n_gpu_layers, base_eb.gpu_sampling ? "on" : "off", base_eb.kv_cache ? "on" : "off");
+
+    // Pre-allocate the PKV store to full capacity. Without this, the first PREFILL request allocates a
+    // small store; a later request with a longer prompt frees and recreates it inside build_graph, which
+    // corrupts the galloc hash (old pointers remain; new tensors look "new") and crashes the Vulkan backend.
+    if (base_eb.kv_cache) {
+        llama_diffusion_preallocate_pkv_store(ctx, maxtok);
+    }
+
     LOG_INF("diffusion-server: listening on %s:%d\n", host.c_str(), port);
 
     httplib::Server svr;
