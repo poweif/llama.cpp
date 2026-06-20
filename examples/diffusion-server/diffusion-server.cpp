@@ -186,6 +186,18 @@ struct gen_request {
 // `stream_q` (null for non-streaming / buffered-tool-call mode).
 // Returns the full assembled response text.
 // Does NOT push [DONE] or call stream_q->finish() — the caller is responsible.
+// Strip DiffusionGemma thinking channels: <|channel>NAME\nCONTENT<channel|>ACTUAL_RESPONSE
+// Returns everything after the last <channel|>, trimming any leading whitespace.
+// If no thinking channel is present, returns the text unchanged.
+static std::string strip_thinking(const std::string & text) {
+    const std::string close = "<channel|>";
+    size_t pos = text.find(close);
+    if (pos == std::string::npos) return text;
+    std::string after = text.substr(pos + close.size());
+    size_t start = after.find_first_not_of(" \t\n\r");
+    return start == std::string::npos ? "" : after.substr(start);
+}
+
 // ---------------------------------------------------------------------------
 static std::string run_generation(server_state & st,
                                   const gen_request & req,
@@ -196,7 +208,8 @@ static std::string run_generation(server_state & st,
     std::vector<llama_token> output_tokens((size_t) st.maxtok);
     std::vector<llama_token> answer;
     std::string              full_text;
-    bool                     first_block = true;
+    bool                     first_block   = true;
+    bool                     past_thinking = false; // true once we have passed <channel|>
 
     for (int b = 0; b < std::max(1, req.n_blocks); b++) {
         const int32_t prefix_len = (int32_t) prefix.size();
@@ -219,21 +232,43 @@ static std::string run_generation(server_state & st,
         const size_t        cut    = trim_canvas(st.vocab, canvas, (size_t) st.canvas_length);
 
         answer.insert(answer.end(), canvas, canvas + cut);
-        // special=true to preserve <|channel|> reasoning markers for clients that want them
+        // special=true so <|channel>/<channel|> markers are present for stripping below
         const std::string block_text = common_detokenize(st.vocab, answer, true);
 
         if (stream_q) {
-            const std::string delta = block_text.substr(full_text.size());
-            stream_q->push(make_sse_chunk(req_id, st.model_name, delta, first_block));
+            if (!past_thinking) {
+                // Look for the thinking-channel close tag in the cumulative text.
+                const std::string close = "<channel|>";
+                size_t close_pos = block_text.find(close);
+                if (close_pos != std::string::npos) {
+                    past_thinking = true;
+                    // Emit only the visible portion after the close tag (trim leading whitespace).
+                    std::string visible = block_text.substr(close_pos + close.size());
+                    size_t vstart = visible.find_first_not_of(" \t\n\r");
+                    if (vstart != std::string::npos) {
+                        stream_q->push(make_sse_chunk(req_id, st.model_name,
+                                                      visible.substr(vstart), first_block));
+                        first_block = false;
+                    }
+                }
+                // else: still inside the thinking block — suppress output until close tag appears
+            } else {
+                // Already past thinking — stream new delta normally.
+                const std::string delta = block_text.substr(full_text.size());
+                if (!delta.empty()) {
+                    stream_q->push(make_sse_chunk(req_id, st.model_name, delta, first_block));
+                    first_block = false;
+                }
+            }
         }
-        full_text   = block_text;
-        first_block = false;
+        full_text = block_text;
 
         if (cut < (size_t) st.canvas_length) { break; }
         prefix.insert(prefix.end(), canvas, canvas + cut);
     }
 
-    return full_text;
+    // Always return the clean (thinking-stripped) text so the caller can parse/forward it.
+    return strip_thinking(full_text);
 }
 
 // ---------------------------------------------------------------------------
