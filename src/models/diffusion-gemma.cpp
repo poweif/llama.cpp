@@ -120,6 +120,11 @@ public:
     ~llm_graph_input_attn_diffusion_decode() = default;
 
     void set_input(const llama_ubatch * /*ubatch*/) override {
+        // The decode mask is constant for the entire block (P and C never change mid-block).
+        // Skip refilling on graph-reuse steps to avoid O(C*(P+C)) CPU work and re-upload.
+        if (mask_valid) { return; }
+        mask_valid = true;
+
         const int64_t P    = n_prompt;
         const int64_t C    = n_canvas;
         const int64_t n_kv = P + C;
@@ -162,8 +167,10 @@ public:
         }
     }
 
-    bool can_reuse(const llm_graph_params & /*params*/) override { return false; }
+    // The mask is constant across all steps of a block; allow graph reuse once filled.
+    bool can_reuse(const llm_graph_params & /*params*/) override { return mask_valid; }
 
+    bool    mask_valid = false;
     int64_t n_prompt;
     int64_t n_canvas;
 };
@@ -413,10 +420,12 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
     }
 
     // Canvas input embedding = rms_norm_noscale(embed*sqrt(n_embd) [+ self-conditioning]). Shared by
-    // UNIFIED canvas rows and the DECODE batch. Zero SC -> exactness forward.
+    // UNIFIED canvas rows and the DECODE batch.
+    // SC is skipped when sc_use==0 (step 0): the result would be zeroed anyway, so we save the
+    // softmax + 240-GFLOP matmul + MLP. The graph is rebuilt at the step-0→1 transition when
+    // sc_use flips to 1, so the two variants never share a cached graph.
     auto dg_canvas_embed = [&](ggml_tensor * canvas) -> ggml_tensor * {
-        // build the SC subgraph whenever SC is enabled (reserve covers it; upload only when a buffer is set)
-        if (dmodel.sc_enabled) {
+        if (dmodel.sc_enabled && dmodel.sc_use != 0.0f) {
             const int64_t Cc      = canvas->ne[1];
             const int64_t n_vocab = model.tok_embd->ne[1];
             canvas = ggml_cont(ctx0, canvas);
@@ -449,11 +458,10 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
             ggml_tensor * g  = ggml_gelu(ctx0, ggml_mul_mat(ctx0, model.sc_gate, normed)); // [n_ff, Cc]
             ggml_tensor * u  = ggml_mul_mat(ctx0, model.sc_up, normed);                    // [n_ff, Cc]
             ggml_tensor * sc_sig = ggml_mul_mat(ctx0, model.sc_down, ggml_mul(ctx0, g, u)); // [n_embd, Cc]
-            sc_sig = ggml_scale(ctx0, sc_sig, dmodel.sc_use); // runtime {0,1} gate (0 == first step)
             canvas = ggml_add(ctx0, canvas, sc_sig);
             canvas = ggml_rms_norm(ctx0, canvas, hparams.f_norm_rms_eps); // post_norm, no scale
         } else {
-            canvas = ggml_rms_norm(ctx0, canvas, hparams.f_norm_rms_eps); // no scale (zero-SC)
+            canvas = ggml_rms_norm(ctx0, canvas, hparams.f_norm_rms_eps); // no SC (step 0 or SC disabled)
         }
         return canvas;
     };

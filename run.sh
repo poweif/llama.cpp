@@ -34,7 +34,7 @@ if (( use_diffusion )); then
         -m /home/poweif/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q8_0.gguf \
         "${device_args[@]}" \
         -ngl 99 \
-        --port 8190 \
+        --port 8080 \
         --override-kv diffusion.canvas_length=int:64 \
         "$@"
 fi

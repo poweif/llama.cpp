@@ -191,11 +191,28 @@ struct gen_request {
 // If no thinking channel is present, returns the text unchanged.
 static std::string strip_thinking(const std::string & text) {
     const std::string close = "<channel|>";
-    size_t pos = text.find(close);
-    if (pos == std::string::npos) return text;
-    std::string after = text.substr(pos + close.size());
-    size_t start = after.find_first_not_of(" \t\n\r");
-    return start == std::string::npos ? "" : after.substr(start);
+    // Use rfind: the model may generate multiple channel blocks (e.g. an empty
+    // thought block followed by an unlabelled content block ending with another
+    // <channel|>).  The actual response always follows the LAST close tag.
+    size_t pos = text.rfind(close);
+    if (pos != std::string::npos) {
+        std::string after = text.substr(pos + close.size());
+        size_t start = after.find_first_not_of(" \t\n\r");
+        return start == std::string::npos ? "" : after.substr(start);
+    }
+    // No close tag: canvas ran out of tokens inside a thinking block.
+    // Strip the "<|channel>NAME\n" opening so the caller gets the text content
+    // rather than leaking raw special-token syntax to the client.
+    const std::string open = "<|channel>";
+    if (text.substr(0, open.size()) == open) {
+        size_t nl = text.find('\n');
+        if (nl != std::string::npos) {
+            std::string rest = text.substr(nl + 1);
+            size_t start = rest.find_first_not_of(" \t\n\r");
+            return start == std::string::npos ? "" : rest.substr(start);
+        }
+    }
+    return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +256,8 @@ static std::string run_generation(server_state & st,
             if (!past_thinking) {
                 // Look for the thinking-channel close tag in the cumulative text.
                 const std::string close = "<channel|>";
-                size_t close_pos = block_text.find(close);
+                // rfind: same reason as strip_thinking — actual response is after the LAST close.
+                size_t close_pos = block_text.rfind(close);
                 if (close_pos != std::string::npos) {
                     past_thinking = true;
                     // Emit only the visible portion after the close tag (trim leading whitespace).
@@ -369,7 +387,11 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
         const json body = json::parse(req.body);
         stream      = body.value("stream", false);
         gr.seed     = body.value("seed",     0);
-        gr.n_blocks = body.value("n_blocks", 1);
+        // Target ~256 tokens of generation budget regardless of canvas_length so the
+        // model has room to think in early blocks and still produce a visible response.
+        // Callers can override via "n_blocks" in the request body.
+        const int default_n_blocks = std::max(1, 256 / (int) st.canvas_length);
+        gr.n_blocks = body.value("n_blocks", default_n_blocks);
         req_id      = body.value("id", std::string("chatcmpl-") + std::to_string(ggml_time_us()));
 
         const json & msg_arr = body.at("messages");
@@ -438,9 +460,14 @@ static void handle_chat_completions(const httplib::Request & req, httplib::Respo
                 if (has_tools) {
                     const auto parsed = parse_response(full_text, chat_params);
 
-                    // Emit content delta (clean, without embedded tool-call syntax).
-                    if (!parsed.content.empty()) {
-                        q->push(make_sse_chunk(req_id, st.model_name, parsed.content, true));
+                    // Prefer parsed.content; fall back to the stripped full_text when
+                    // the PEG parser found no content (e.g. plain response with no tool call).
+                    const std::string & content =
+                        (parsed.content.empty() && parsed.tool_calls.empty())
+                            ? full_text : parsed.content;
+
+                    if (!content.empty()) {
+                        q->push(make_sse_chunk(req_id, st.model_name, content, true));
                     }
 
                     // Emit one chunk per tool call.
@@ -750,6 +777,8 @@ int main(int argc, char ** argv) {
     // Pre-allocate the PKV store to full capacity. Without this, the first PREFILL request allocates a
     // small store; a later request with a longer prompt frees and recreates it inside build_graph, which
     // corrupts the galloc hash (old pointers remain; new tensors look "new") and crashes the Vulkan backend.
+    // Note: the first request will log a few ggml_gallocr_needs_realloc errors for pkv_k/leaf tensors;
+    // these are benign — ggml automatically re-reserves and retries — and only appear on the first call.
     if (base_eb.kv_cache) {
         llama_diffusion_preallocate_pkv_store(ctx, maxtok);
     }
