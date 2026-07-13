@@ -847,7 +847,9 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
             qs.has_tied_embeddings = false;
         }
     }
-    qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer();
+    // include NextN/MTP blocks (if any): they carry their own MoE FFN and are laid
+    // out at layer indices [n_layer(), n_layer_all), so the bound must cover them too.
+    qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer_all;
 }
 
 //
