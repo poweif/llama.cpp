@@ -5,13 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 use_vulkan=0
 use_qwen3=0
+use_qwen36_mtp=0
 use_gemma_mtp=0
+use_gemma_dense_mtp=0
+use_diffusion=0
 passthrough=()
 for arg in "$@"; do
     case "$arg" in
-        --vulkan)     use_vulkan=1 ;;
-        --qwen3)      use_qwen3=1 ;;
-        --gemma-mtp)  use_gemma_mtp=1 ;;
+        --vulkan)          use_vulkan=1 ;;
+        --qwen3)           use_qwen3=1 ;;
+        --qwen36-mtp)      use_qwen36_mtp=1 ;;
+        --gemma-mtp)       use_gemma_mtp=1 ;;
+        --gemma-dense-mtp) use_gemma_dense_mtp=1 ;;
+        --diffusion)       use_diffusion=1 ;;
         *)            passthrough+=("$arg") ;;
     esac
 done
@@ -19,6 +25,21 @@ set -- "${passthrough[@]+"${passthrough[@]}"}"
 
 if (( use_vulkan )); then
     export HIP_VISIBLE_DEVICES=""
+fi
+
+if (( use_diffusion )); then
+    device_args=()
+    if (( use_vulkan )); then
+        device_args=(--device Vulkan0)
+    else
+        device_args=(--device ROCm0)
+    fi
+    exec "$SCRIPT_DIR/build/bin/llama-diffusion-cli" \
+        -m /home/poweif/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q8_0.gguf \
+        "${device_args[@]}" \
+        -ngl 99 \
+        --override-kv diffusion.canvas_length=int:64 \
+        "$@"
 fi
 
 if (( use_gemma_mtp )); then
@@ -41,10 +62,49 @@ if (( use_gemma_mtp )); then
 	--no-warmup
     )
 
+elif (( use_gemma_dense_mtp )); then
+    args=(
+	-m /home/poweif/models/gemma-4-31B-it-Q8_0.gguf
+	-md /home/poweif/models/gemma-4-31B-it-assistant-Q8_0.gguf
+	--spec-type draft-mtp
+	--spec-draft-n-max 3
+	-ngl 99
+	--spec-draft-ngl 99
+	-fa on
+	-c 131072
+	-n 16384
+	-b 4096
+	-ub 512
+	--jinja
+	--reasoning off
+	--no-warmup
+    )
+
 elif (( use_qwen3 )); then
     args=(
 	-m /home/poweif/models/Qwen_Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf
 	-ngl 99
+	-fa on
+	-c 262144
+	-n 16384
+	-b 4096
+	-ub 512
+	--no-context-shift
+	--jinja
+	--cache-type-k q8_0
+	--cache-type-v q8_0
+	--no-warmup
+    )
+
+elif (( use_qwen36_mtp )); then
+    args=(
+	# self-converted from Qwen/Qwen3.6-35B-A3B, Q8_0 quantized with unsloth's
+	# imatrix; MTP block is embedded in this single file, so no -md is needed.
+	-m /home/poweif/models/Qwen3.6-35B-A3B-Q8_0-imat.gguf
+	--spec-type draft-mtp
+	--spec-draft-n-max 3
+	-ngl 99
+	--spec-draft-ngl 99
 	-fa on
 	-c 262144
 	-n 16384

@@ -5,15 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 use_vulkan=0
 use_qwen3=0
+use_qwen36_mtp=0
 use_gemma_mtp=0
+use_gemma_dense_mtp=0
 use_diffusion=0
 passthrough=()
 for arg in "$@"; do
     case "$arg" in
-        --vulkan)     use_vulkan=1 ;;
-        --qwen3)      use_qwen3=1 ;;
-        --gemma-mtp)  use_gemma_mtp=1 ;;
-        --diffusion)  use_diffusion=1 ;;
+        --vulkan)          use_vulkan=1 ;;
+        --qwen3)           use_qwen3=1 ;;
+        --qwen36-mtp)      use_qwen36_mtp=1 ;;
+        --gemma-mtp)       use_gemma_mtp=1 ;;
+        --gemma-dense-mtp) use_gemma_dense_mtp=1 ;;
+        --diffusion)       use_diffusion=1 ;;
         *)            passthrough+=("$arg") ;;
     esac
 done
@@ -58,13 +62,33 @@ if (( use_gemma_mtp )); then
 	-ub 512
 	--cache-reuse 256
 	--jinja
-	--reasoning auto
-#	--reasoning on          # keep thinking on for coding quality
+#	--reasoning auto
+	--reasoning on          # keep thinking on for coding quality
 #	--reasoning-budget 1024 # cap thinking at 1024 tokens so the predictable answer tokens get MTP speedup
 	--port 8080
 	# NOTE: do NOT add --cache-type-k/v q8_0 here.
 	# The gemma4-assistant reads K/V directly from the target's KV cache (frozen KV);
 	# quantizing those tensors breaks the frozen-KV attention and collapses draft acceptance to ~0%.
+	--defrag-thold 0.1
+    )
+
+elif (( use_gemma_dense_mtp )); then
+    args=(
+	-m /home/poweif/models/gemma-4-31B-it-Q8_0.gguf
+	-md /home/poweif/models/gemma-4-31B-it-assistant-Q8_0.gguf
+	--spec-type draft-mtp
+	--spec-draft-n-max 3
+	-ngl 99
+	--spec-draft-ngl 99
+	-fa on
+	-c 131072
+	-n 16384
+	-b 4096
+	-ub 512
+	--cache-reuse 256
+	--jinja
+	--reasoning auto
+	--port 8080
 	--defrag-thold 0.1
     )
 
@@ -90,6 +114,33 @@ elif (( use_qwen3 )); then
 	--cache-ram 4096
 	# Trigger KV cache defragmentation when 10% of cells are fragmented.
 	# Deprecated flag but still functional; reduces fragmentation-driven bloat.
+	--defrag-thold 0.1
+    )
+
+elif (( use_qwen36_mtp )); then
+    args=(
+	# self-converted from Qwen/Qwen3.6-35B-A3B, Q8_0 quantized with unsloth's
+	# imatrix (unsloth's own quant drops the MTP block; naive Q8_0 without an
+	# imatrix corrupts the Gated-DeltaNet gate/alpha/beta weights). MTP block
+	# is embedded in this single file, so no -md is needed.
+	-m /home/poweif/models/Qwen3.6-35B-A3B-Q8_0-imat.gguf
+	--spec-type draft-mtp
+	--spec-draft-n-max 3
+	-ngl 99          # offload all layers to GPU
+	--spec-draft-ngl 99
+	-fa on
+	-c 262144        # max context length (tokens)
+	-n 16384         # max tokens to generate per request
+	-b 4096          # prompt batch size: larger = faster ingestion, more VRAM
+	-ub 512          # micro-batch size: smaller = lower latency per decode step
+	--no-context-shift  # error on context overflow instead of silently rotating the window
+	--cache-reuse 256   # reuse KV cache for requests sharing a 256-token prefix
+	--jinja          # enable Jinja2 chat templates
+	--reasoning auto
+	--port 8080
+	--cache-type-k q8_0  # quantize KV cache to Q8_0: lower VRAM, minimal quality loss
+	--cache-type-v q8_0
+	--cache-ram 4096
 	--defrag-thold 0.1
     )
 
