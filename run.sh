@@ -9,6 +9,8 @@ use_qwen36_mtp=0
 use_gemma_mtp=0
 use_gemma_dense_mtp=0
 use_diffusion=0
+use_deepseek4=0
+use_deepseek4_own=0
 passthrough=()
 for arg in "$@"; do
     case "$arg" in
@@ -18,6 +20,8 @@ for arg in "$@"; do
         --gemma-mtp)       use_gemma_mtp=1 ;;
         --gemma-dense-mtp) use_gemma_dense_mtp=1 ;;
         --diffusion)       use_diffusion=1 ;;
+        --deepseek4)       use_deepseek4=1 ;;
+        --deepseek4-own)   use_deepseek4_own=1 ;;
         *)            passthrough+=("$arg") ;;
     esac
 done
@@ -58,10 +62,11 @@ if (( use_gemma_mtp )); then
 	-fa on
 	-c 262144
 	-n 16384
-	-b 4096
+	-b 8192
 	-ub 512
 	--cache-reuse 256
 	--jinja
+	--temp 0.1
 #	--reasoning auto
 	--reasoning on          # keep thinking on for coding quality
 #	--reasoning-budget 1024 # cap thinking at 1024 tokens so the predictable answer tokens get MTP speedup
@@ -83,7 +88,7 @@ elif (( use_gemma_dense_mtp )); then
 	-fa on
 	-c 131072
 	-n 16384
-	-b 4096
+	-b 8192	
 	-ub 512
 	--cache-reuse 256
 	--jinja
@@ -92,14 +97,58 @@ elif (( use_gemma_dense_mtp )); then
 	--defrag-thold 0.1
     )
 
+elif (( use_deepseek4 )); then
+    args=(
+	# 256x8.4B MoE, IQ3_XXS, split across 4 shards (~96GB total). Point at
+	# shard 1; llama.cpp finds the rest via the split.count/split.no metadata.
+	-m /home/poweif/models/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf
+	-ngl 99          # offload all layers to GPU (unified memory, no VRAM penalty)
+	-fa on
+	-c 32768         # native training length is 65536 (yarn-extended to 1048576);
+	                 # kept modest since weights alone are ~96GB against 122GB RAM
+	-n 16384
+	-b 2048
+	-ub 512
+	--jinja
+	--reasoning auto
+	--port 8080
+	--cache-type-k q8_0  # MLA-compressed KV is already small; quantize anyway for headroom
+	--cache-type-v q8_0
+	--defrag-thold 0.1
+    )
+
+elif (( use_deepseek4_own )); then
+    args=(
+	# Self-converted from the official deepseek-ai/DeepSeek-V4-Flash checkpoint
+	# (not Unsloth's), with MTP block tensors retained (blk.43.nextn.*) for
+	# speculative-decode work - Unsloth's public GGUF strips these. MTP itself
+	# is NOT enabled here: even after fixing the seq_rm/t_h_nextn bugs that made
+	# it slow, it's still ~30% slower than plain decode on this quant (draft
+	# overhead isn't recovered by MoE routing overlap - see project memory).
+	# IQ2_S w/ custom imatrix, ~88.7GB single file - small enough to fit
+	# entirely on GPU-addressable unified memory, no CPU MoE offload needed.
+	-m /home/poweif/models/DeepSeek-V4-Flash-own-gguf/DeepSeek-V4-Flash-own-IQ2_S.gguf
+	-ngl 99
+	-fa on
+	-c 32768
+	-n 16384
+	-b 4096
+	-ub 512
+	--jinja
+	--reasoning auto
+	--port 8080
+	--cache-type-k q8_0
+	--cache-type-v q8_0
+    )
+
 elif (( use_qwen3 )); then
     args=(
-	-m /home/poweif/models/Qwen_Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf	
+	-m /home/poweif/models/Qwen_Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf
 	-ngl 99          # offload all layers to GPU
 	-fa on           # flash attention: faster, lower VRAM on long contexts
 	-c 262144        # max context length (tokens)
 	-n 16384         # max tokens to generate per request
-	-b 4096          # prompt batch size: larger = faster ingestion, more VRAM
+	-b 8192          # prompt batch size: larger = faster ingestion, more VRAM
 	-ub 512          # micro-batch size: smaller = lower latency per decode step
 	--no-context-shift  # error on context overflow instead of silently rotating the window
 	--cache-reuse 256   # reuse KV cache for requests sharing a 256-token prefix (system prompt, file context)
